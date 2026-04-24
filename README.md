@@ -19,3 +19,5 @@ White - M1B, Red - M1A
 Right Motor
 White - M2A, Red - M2B
 In this config, both motors run forward.
+
+REMINDER: If the robot gets stuck, use the encoder to determine if the robot is stuck and tell it to back up.

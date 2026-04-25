@@ -14,10 +14,15 @@ This repository contains code for a robot that can navigate an unknown (fully co
 
 The `MazeRunner` folder represents the integrated system, while `dev_utils` includes modular experiments and test implementations that supported development.
 
-Left Motor
+### Connection Notes
+Wheel Motors
+Left
 White - M1B, Red - M1A
-Right Motor
+Right
 White - M2A, Red - M2B
 In this config, both motors run forward.
+
+Roller Motors
+IN1 -> GND, IN2 -> pin5, OUT1 -> Motor Red, OUT2 -> Motor Black
 
 REMINDER: If the robot gets stuck, use the encoder to determine if the robot is stuck and tell it to back up.

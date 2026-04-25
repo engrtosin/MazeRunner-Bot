@@ -1,5 +1,5 @@
 /* PIN DEFINITIONS */
-int IRpin = A2;
+int IRpin = A3;
 
 // /* SENSOR CALIBRATION (same as before) - FRONT */
 const float A = 1.23072369e+04;

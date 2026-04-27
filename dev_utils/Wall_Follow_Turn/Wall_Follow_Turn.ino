@@ -96,24 +96,38 @@ const unsigned long IR_SAMPLE_TIME = 10000;
 #define TARGET_LEFT_DIST   20.0
 #define FRONT_STOP_DIST    30.0
 #define FRONT_SLOW_DIST    30.0
+#define EXIT_FRONT_DIST  500.0  // cm — front reads open air
+#define EXIT_FRONT_DIST_MIN 250.0
+#define EXIT_LEFT_DIST   300.0  // cm — left reads open air
+#define EXIT_LEFT_DIST_MAX   1000.0  // cm — left reads open air
 
 // ================= SPEEDS =================
 #define BASE_SPEED         15
 #define SLOW_SPEED         7
 #define TURN_SPEED         7    // RPM for both wheels during pivot
+#define OUTER_TURN_SPEED   3
 
 // ================= PIVOT TURN GEOMETRY =================
 // Each wheel travels π × wheelbase / 4 for a 90° pivot
 // counts = arc_mm / circumference_mm × CPR
 // arc_mm = π × 340 / 4 ≈ 267 mm
 // circumference = π × 65 ≈ 204 mm
-#define TURN_COUNTS_L  191   // (267 / 204) × 342
-#define TURN_COUNTS_R  193   // (267 / 204) × 347
+#define TURN_COUNTS_L  188
+#define TURN_COUNTS_R  190
+#define OUTER_TURN_COUNTS_L  171
+#define OUTER_TURN_COUNTS_R  173
+// #define OUTER_TURN_COUNTS_L  96    // half of TURN_COUNTS_L
+// #define OUTER_TURN_COUNTS_R  97    // half of TURN_COUNTS_R
+#define CREEP_COUNTS_L  383   // ~23 cm
+#define CREEP_COUNTS_R  389
+#define WALL_LOST_DIST       90.0  // cm — left sensor above this = wall lost
 
 // ================= STATE MACHINE =================
 enum RobotState {
   STATE_WALL_FOLLOW,
   STATE_TURNING,
+  STATE_OUTER_CORNER,
+  STATE_EXIT,
   STATE_STOPPED
 };
 
@@ -121,6 +135,7 @@ RobotState robotState = STATE_WALL_FOLLOW;
 
 long turnStartCountL = 0;
 long turnStartCountR = 0;
+bool creepDone = false;
 
 // ================= IR READINGS =================
 float frontDistanceCM = 0;
@@ -269,7 +284,7 @@ void updateControl() {
   updateRPM(leftMotor,  dt);
   updateRPM(rightMotor, dt);
 
-  if (robotState == STATE_WALL_FOLLOW) {
+  if (robotState == STATE_WALL_FOLLOW || robotState == STATE_OUTER_CORNER) {
     updatePID(leftMotor,  dt);
     updatePID(rightMotor, dt);
   }
@@ -279,6 +294,16 @@ void updateControl() {
 void doWallFollow() {
   Serial.print("F: "); Serial.print(frontDistanceCM);
   Serial.print(" | L: "); Serial.print(leftDistanceCM);
+
+  if (leftDistanceCM > WALL_LOST_DIST  && frontDistanceCM < 91.5f) {
+    hardStop();
+    delay(200);
+    turnStartCountL = leftMotor.count;
+    turnStartCountR = rightMotor.count;
+    robotState = STATE_OUTER_CORNER;
+    Serial.println(" | -> OUTER_CORNER");
+    return;
+  }
 
   if (frontDistanceCM > 0 && frontDistanceCM < FRONT_STOP_DIST) {
     hardStop();
@@ -335,6 +360,55 @@ void doTurning() {
   else                          setMotorPWM(rightMotor,  0);
 }
 
+// ================= STATE: PIVOT TURN 90° LEFT =================
+void doOuterCorner() {
+
+  // ── Phase 1: approach front wall to TARGET_LEFT_DIST ──
+  if (!creepDone) {
+    Serial.print("Approach front: "); Serial.println(frontDistanceCM);
+
+    if (frontDistanceCM <= FRONT_STOP_DIST) {
+      hardStop();
+      delay(200);
+      creepDone = true;
+      turnStartCountL = leftMotor.count;
+      turnStartCountR = rightMotor.count;
+      return;
+    }
+
+    // Simple proportional approach — reuse SLOW_SPEED as base
+    float error      = frontDistanceCM - TARGET_LEFT_DIST;
+    float correction = constrain(1.0 * error, -5, 5);
+    int leftRpm      = constrain(SLOW_SPEED + (int)correction, 0, 20);
+    int rightRpm     = constrain(SLOW_SPEED + (int)correction, 0, 20);
+
+    leftMotor.targetRPM  = leftRpm;
+    rightMotor.targetRPM = rightRpm;
+    return;
+  }
+
+  // ── Phase 2: pivot left 90° ──
+  long pivotL = abs(leftMotor.count - turnStartCountL);
+  long pivotR = abs(rightMotor.count - turnStartCountR);
+
+  Serial.print("Outer pivot L: "); Serial.print(pivotL);
+  Serial.print(" / "); Serial.print(OUTER_TURN_COUNTS_L);
+  Serial.print(" | R: "); Serial.print(pivotR);
+  Serial.print(" / "); Serial.println(OUTER_TURN_COUNTS_R);
+
+  if (pivotL >= OUTER_TURN_COUNTS_L && pivotR >= OUTER_TURN_COUNTS_R) {
+    hardStop();
+    Serial.println("Outer turn complete -> WALL_FOLLOW");
+    creepDone = false;
+    robotState = STATE_WALL_FOLLOW;
+    return;
+  }
+
+  int pwmVal = map(OUTER_TURN_SPEED, 0, 20, 0, 255);
+  setMotorPWM(leftMotor,  pivotL < OUTER_TURN_COUNTS_L ? -pwmVal : 0);
+  setMotorPWM(rightMotor, pivotR < OUTER_TURN_COUNTS_R ?  pwmVal : 0);
+}
+
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
@@ -351,6 +425,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENC_R), rightISR, RISING);
 
   enableDriver();
+  delay(2000);  // let IR sensors stabilize before starting
 
   lastControlTime = millis();
   prevIRTime      = micros();
@@ -368,9 +443,19 @@ void loop() {
   updateIR();
   updateControl();
 
+  if (robotState != STATE_STOPPED && robotState != STATE_EXIT) {
+    if (frontDistanceCM < EXIT_FRONT_DIST && leftDistanceCM > EXIT_LEFT_DIST && leftDistanceCM < EXIT_LEFT_DIST_MAX) {
+      hardStop();
+      robotState = STATE_EXIT;
+      Serial.println("EXIT detected — stopping permanently.");
+    }
+  }
+
   switch (robotState) {
-    case STATE_WALL_FOLLOW: doWallFollow(); break;
-    case STATE_TURNING:     doTurning();    break;
-    case STATE_STOPPED:     break;
+    case STATE_WALL_FOLLOW:  doWallFollow();  break;
+    case STATE_TURNING:      doTurning();     break;
+    case STATE_OUTER_CORNER: doOuterCorner(); break;
+    case STATE_EXIT:                          break;
+    case STATE_STOPPED:                       break;
   }
 }

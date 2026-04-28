@@ -94,5 +94,5 @@ float IRSensor::applyMovingAverage(float x) {
 // -------------------------------------------------------
 
 float IRSensor::adcToDistance(float adc) {
-    return max(_a / (adc + _b) + _c, 0.0f);
+    return constrain(_a / (adc + _b) + _c, 0.0f, 500.0f);
 }

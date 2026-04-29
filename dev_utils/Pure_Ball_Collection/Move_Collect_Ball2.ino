@@ -17,17 +17,14 @@
 //    leftRPM  = SLOW_SPEED + correction
 //    rightRPM = SLOW_SPEED - correction
 //
-//  Ball detection zones (from RPi y_byte):
-//    y_byte >= Y_COLLECT_THRESH → ball is close enough to collect
-//    Ball centre below frame centerline is already enforced on RPi.
-//
 //  Collection sequence:
-//    1. y_byte >= Y_COLLECT_THRESH → start rollers (pin 5 HIGH),
-//       transition to STATE_COLLECT
-//    2. STATE_COLLECT: rollers on, robot creeps forward at
-//       CREEP_SPEED until break beam (A5) reads 0
-//    3. Break beam triggered → stop rollers, stop motors,
-//       transition to STATE_COLLECTED
+//    1. TRACK: robot approaches ball, steering to keep it centred.
+//    2. When y_byte >= Y_COLLECT_THRESH (ball at very bottom of
+//       frame), rollers turn on and robot transitions to COLLECT.
+//    3. COLLECT: rollers stay on, robot creeps straight forward.
+//       Ball lost signal is ignored — finish the job.
+//    4. Break beam (A5 == 0) → stop motors, stop rollers → COLLECTED.
+//    5. COLLECTED: pause 2s then reset to SEARCH.
 //
 //  State flow:
 //    SEARCH -> TRACK -> COLLECT -> COLLECTED -> SEARCH
@@ -46,7 +43,7 @@
 #define ENC_R        3
 
 #define ROLLER_PIN   5    // HIGH = rollers on, LOW = rollers off
-#define BREAK_BEAM   A5   // reads 0 when ball crosses beam
+#define BREAK_BEAM   A5   // analogRead == 0 when ball crosses beam
 
 // ================= MOTOR STRUCT =================
 struct Motor {
@@ -75,24 +72,20 @@ unsigned long stateEntryMs = 0;
 #define STATE_ENTRY_DELAY_MS 300
 
 // ================= SPEEDS =================
-#define SLOW_SPEED      7     // RPM — base forward speed during tracking
-#define CREEP_SPEED     3     // RPM — very slow forward during collection
-#define MAX_CORRECTION  3     // RPM — max differential per wheel during tracking
+#define SLOW_SPEED      7    // RPM — forward speed during tracking
+#define CREEP_SPEED     3    // RPM — forward speed during collection
+#define MAX_CORRECTION  3    // RPM — max differential per wheel during tracking
 
 // ================= HEADING CORRECTION =================
-#define X_CENTER   127        // midpoint of 0-255 x space
-#define DEAD_BAND    8        // ± no-correction zone around centre
+#define X_CENTER   127       // midpoint of 0-255 x space
+#define DEAD_BAND    8       // ± no-correction zone around centre
 
-float Kp_heading = 0.030f;   // proportional gain for steering
+float Kp_heading = 0.030f;
 
 // ================= BALL PROXIMITY THRESHOLD =================
-// y_byte is 0-255 mapped from top(0) to bottom(255) of frame.
-// The RPi already filters out balls above the centerline,
-// so y_byte is always >= 127 when a ball is reported.
-// Y_COLLECT_THRESH sets how far into the lower half triggers collection.
-// 220/255 ≈ bottom 14% of frame — ball is very close to robot.
-// Tune this value based on your camera height and robot geometry.
-#define Y_COLLECT_THRESH  220
+// y_byte 254 = ball centre is at the very bottom of the frame.
+// Robot tracks until ball reaches this point, then starts collection.
+#define Y_COLLECT_THRESH  254
 
 // ================= BALL TIMEOUT =================
 #define BALL_TIMEOUT_MS  300  // no packet for this long = ball lost
@@ -108,7 +101,7 @@ bool ballVisible() {
 enum RobotState {
   STATE_SEARCH,     // stopped, waiting for ball
   STATE_TRACK,      // drive + differential steer to centre ball
-  STATE_COLLECT,    // rollers on, creep forward until break beam triggers
+  STATE_COLLECT,    // rollers on, creep forward until break beam fires
   STATE_COLLECTED,  // ball secured — stop everything, pause, reset
   STATE_STOPPED
 };
@@ -224,21 +217,22 @@ void doSearch() {
 }
 
 // ================= STATE: TRACK =================
-// Drive forward + proportional differential steering toward ball centre.
-// When y_byte >= Y_COLLECT_THRESH, ball is close — hand off to COLLECT.
+// Drive forward with proportional differential steering.
+// When ball reaches the bottom of the frame, start collection.
 // No Serial.print() — runs every loop iteration.
 void doTrack() {
   if (millis() - stateEntryMs < STATE_ENTRY_DELAY_MS) return;
 
-  // Ball close enough — start collection
+  // Ball at very bottom of frame — close enough to collect
   if (pkt[1] >= Y_COLLECT_THRESH) {
+    rollersOn();
     stateEntryMs = millis();
     robotState   = STATE_COLLECT;
-    Serial.println("Ball close -> COLLECT");
+    Serial.println("Ball at bottom -> COLLECT");
     return;
   }
 
-  float error = (float)pkt[0] - (float)X_CENTER;  // +ve = ball to the right
+  float error = (float)pkt[0] - (float)X_CENTER;
 
   float correction = 0;
   if (abs(error) > DEAD_BAND) {
@@ -246,8 +240,6 @@ void doTrack() {
     correction = constrain(correction, -(float)MAX_CORRECTION, (float)MAX_CORRECTION);
   }
 
-  // Ball right → left faster → curves right
-  // Ball left  → right faster → curves left
   float leftRPM  = SLOW_SPEED + correction;
   float rightRPM = SLOW_SPEED - correction;
 
@@ -259,8 +251,9 @@ void doTrack() {
 }
 
 // ================= STATE: COLLECT =================
-// Rollers on, robot creeps forward very slowly.
-// Exits when break beam reads 0 (ball crosses sensor).
+// Rollers stay on. Robot creeps straight forward.
+// Ball lost signal is ignored — we're this close, finish it.
+// Exits only when break beam detects ball entry.
 // No Serial.print() — runs every loop iteration.
 void doCollect() {
   rollersOn();
@@ -270,7 +263,7 @@ void doCollect() {
     rollersOff();
     stateEntryMs = millis();
     robotState   = STATE_COLLECTED;
-    Serial.println("Break beam triggered -> COLLECTED");
+    Serial.println("Ball collected -> COLLECTED");
     return;
   }
 
@@ -302,9 +295,9 @@ void setup() {
   stateEntryMs    = millis();
 
   Serial.println("=== Ball Collector Started ===");
-  Serial.print("Base speed=");       Serial.print(SLOW_SPEED);       Serial.println(" RPM");
-  Serial.print("Creep speed=");      Serial.print(CREEP_SPEED);      Serial.println(" RPM");
-  Serial.print("Max correction=");   Serial.print(MAX_CORRECTION);   Serial.println(" RPM");
+  Serial.print("Track speed=");      Serial.print(SLOW_SPEED);        Serial.println(" RPM");
+  Serial.print("Creep speed=");      Serial.print(CREEP_SPEED);       Serial.println(" RPM");
+  Serial.print("Max correction=");   Serial.print(MAX_CORRECTION);    Serial.println(" RPM");
   Serial.print("Kp_heading=");       Serial.print(Kp_heading, 4);
   Serial.print("  Dead band=");      Serial.println(DEAD_BAND);
   Serial.print("Y collect thresh="); Serial.println(Y_COLLECT_THRESH);
@@ -327,7 +320,7 @@ void loop() {
   }
 
   // Ball lost during tracking → back to search
-  // (not applied during COLLECT — once rollers are running, finish the job)
+  // Not checked during COLLECT — once rollers are on, finish the job
   if (robotState == STATE_TRACK && !ballVisible()) {
     hardStop();
     stateEntryMs = millis();

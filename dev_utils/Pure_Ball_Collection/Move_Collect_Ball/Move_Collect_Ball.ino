@@ -2,14 +2,29 @@
 //  Ball Tracker + Collector — Arduino
 //
 //  Serial protocol (RPi -> Arduino, 115200 baud):
-//    2 bytes sent ONLY when ball detected AND position changed:
+//    2 bytes sent every frame when ball is detected:
 //      [0] x_byte : 0-255 mapped from pixel x
 //      [1] y_byte : 0-255 mapped from pixel y
 //
 //    No packet = no ball. Arduino detects ball loss via timeout.
 //
-//  readSerial() is fully non-blocking — it only reads bytes
-//  already in the buffer and never stalls the control loop.
+//  Motion strategy:
+//    Robot drives forward at SLOW_SPEED while applying a gentle
+//    left/right speed differential to keep the ball centred on
+//    the vertical centreline.
+//
+//    error    = x_byte - 127
+//    leftRPM  = SLOW_SPEED + correction
+//    rightRPM = SLOW_SPEED - correction
+//
+//  Collection trigger:
+//    Ball disappears from frame while robot is in STATE_TRACK
+//    (ball has reached the robot and exited the bottom of frame).
+//    → Rollers turn on, robot creeps straight forward.
+//    → Break beam (A5 == 0) confirms ball is inside → stop everything.
+//
+//  State flow:
+//    SEARCH -> TRACK -> COLLECT -> COLLECTED -> SEARCH
 // =============================================================
 
 // ================= PIN DEFINITIONS =================
@@ -18,11 +33,14 @@
 #define M2_DIR 8
 #define M2_PWM 10
 
-#define EN_PIN 4
-#define SF_PIN 12
+#define EN_PIN       4
+#define SF_PIN       12
 
-#define ENC_L 2
-#define ENC_R 3
+#define ENC_L        2
+#define ENC_R        3
+
+#define ROLLER_PIN   5    // HIGH = rollers on, LOW = rollers off
+#define BREAK_BEAM   A4   // analogRead == 0 when ball crosses beam
 
 // ================= MOTOR STRUCT =================
 struct Motor {
@@ -51,19 +69,18 @@ unsigned long stateEntryMs = 0;
 #define STATE_ENTRY_DELAY_MS 300
 
 // ================= SPEEDS =================
-#define SLOW_SPEED   7    // RPM — forward toward ball
-#define ALIGN_SPEED  5    // RPM — pivot during heading correction
+#define SLOW_SPEED      7    // RPM — forward speed during tracking
+#define CREEP_SPEED     3    // RPM — forward speed during collection
+#define MAX_CORRECTION  3    // RPM — max differential per wheel during tracking
 
-// ================= PD HEADING CORRECTION =================
-#define X_CENTER   127    // midpoint of 0-255 x space
-#define DEAD_BAND    8    // ± tolerance (~±6 px on 480-wide frame)
+// ================= HEADING CORRECTION =================
+#define X_CENTER   127       // midpoint of 0-255 x space
+#define DEAD_BAND    8       // ± no-correction zone around centre
 
-float lastHeadingError = 0.0f;
-float Kp_heading       = 0.020f;
-float Kd_heading       = 0.008f;
+float Kp_heading = 0.030f;
 
 // ================= BALL TIMEOUT =================
-#define BALL_TIMEOUT_MS 300   // no packet for this long = ball lost
+#define BALL_TIMEOUT_MS  300  // no packet for this long = ball lost
 
 unsigned long lastPacketMs = 0;
 uint8_t pkt[2] = {0, 0};     // [0]=x_byte, [1]=y_byte
@@ -74,10 +91,10 @@ bool ballVisible() {
 
 // ================= STATE MACHINE =================
 enum RobotState {
-  STATE_SEARCH,     // waiting for ball
-  STATE_ALIGN,      // PD pivot to centre ball horizontally
-  STATE_APPROACH,   // drive straight; ball timeout = collected
-  STATE_COLLECTED,  // brief pause then back to search
+  STATE_SEARCH,     // stopped, waiting for ball to appear
+  STATE_TRACK,      // drive + differential steer toward ball
+  STATE_COLLECT,    // ball left frame — rollers on, creep forward until break beam
+  STATE_COLLECTED,  // break beam fired — stop everything, pause, reset
   STATE_STOPPED
 };
 
@@ -126,6 +143,9 @@ void hardStop() {
   setMotorPWM(rightMotor, 0);
 }
 
+void rollersOn()  { digitalWrite(ROLLER_PIN, HIGH); }
+void rollersOff() { digitalWrite(ROLLER_PIN, LOW);  }
+
 void enableDriver() {
   digitalWrite(EN_PIN, LOW);  delay(5);
   digitalWrite(EN_PIN, HIGH); delay(5);
@@ -140,7 +160,8 @@ void updateRPM(Motor &m, float dt) {
 
 void updatePID(Motor &m, float dt) {
   if (m.targetRPM == 0) {
-    m.integral = 0; m.pwm = 0;
+    m.integral = 0;
+    m.pwm      = 0;
     setMotorPWM(m, 0);
     return;
   }
@@ -161,16 +182,13 @@ void updateControl() {
   lastControlTime = now;
   updateRPM(leftMotor,  dt);
   updateRPM(rightMotor, dt);
-  if (robotState == STATE_APPROACH) {
+  if (robotState == STATE_TRACK || robotState == STATE_COLLECT) {
     updatePID(leftMotor,  dt);
     updatePID(rightMotor, dt);
   }
 }
 
 // ================= SERIAL READ (NON-BLOCKING) =================
-// Drains all complete 2-byte packets from the buffer each call,
-// keeping only the most recent. Never waits for bytes — if fewer
-// than 2 are available it returns immediately.
 void readSerial() {
   while (Serial.available() >= 2) {
     pkt[0] = Serial.read();  // x_byte
@@ -179,79 +197,76 @@ void readSerial() {
   }
 }
 
+// ================= BREAK BEAM =================
+bool breakBeamTriggered() {
+  return (digitalRead(BREAK_BEAM) == LOW);
+ 
+}
+
 // ================= STATE: SEARCH =================
 void doSearch() {
   hardStop();
+  rollersOff();
 }
 
-// ================= STATE: ALIGN =================
-void doAlign() {
+// ================= STATE: TRACK =================
+// Drive forward with proportional differential steering.
+// Ball disappearing = it has reached the robot → handled in loop().
+// No Serial.print() — runs every loop iteration.
+void doTrack() {
   if (millis() - stateEntryMs < STATE_ENTRY_DELAY_MS) return;
 
-  float error = (float)pkt[0] - (float)X_CENTER;  // +ve = ball to the right
-
-  float dt         = (float)intervalMs / 1000.0f;
-  float derivative = (error - lastHeadingError) / dt;
-  lastHeadingError  = error;
-
-  float correction = Kp_heading * error + Kd_heading * derivative;
-  correction = constrain(correction, -(float)ALIGN_SPEED, (float)ALIGN_SPEED);
-
-  if (abs(error) <= DEAD_BAND) {
-    hardStop();
-    lastHeadingError = 0;
-    stateEntryMs     = millis();
-    robotState       = STATE_APPROACH;
-    Serial.println("ALIGNED -> APPROACH");
-    return;
-  }
-
-  int maxPWM  = map(ALIGN_SPEED, 0, 20, 0, 255);
-  int corrPWM = (int)(abs(correction) / (float)ALIGN_SPEED * maxPWM);
-  corrPWM = constrain(corrPWM, 0, maxPWM);
-
-  if (correction > 0) {
-    // Ball to the right → pivot right: left fwd, right back
-    setMotorPWM(leftMotor,   corrPWM);
-    setMotorPWM(rightMotor, -corrPWM);
-  } else {
-    // Ball to the left → pivot left: right fwd, left back
-    setMotorPWM(leftMotor,  -corrPWM);
-    setMotorPWM(rightMotor,  corrPWM);
-  }
-
-  Serial.print("ALIGN | x="); Serial.print(pkt[0]);
-  Serial.print(" err="); Serial.print(error, 1);
-  Serial.print(" corr="); Serial.println(correction, 3);
-}
-
-// ================= STATE: APPROACH =================
-void doApproach() {
-  if (millis() - stateEntryMs < STATE_ENTRY_DELAY_MS) return;
-
-  // Re-align if heading drifts
   float error = (float)pkt[0] - (float)X_CENTER;
-  if (abs(error) > DEAD_BAND * 2) {
+
+  float correction = 0;
+  if (abs(error) > DEAD_BAND) {
+    correction = Kp_heading * error;
+    correction = constrain(correction,
+                           -(float)MAX_CORRECTION,
+                            (float)MAX_CORRECTION);
+  }
+
+  float leftRPM  = SLOW_SPEED + correction;
+  float rightRPM = SLOW_SPEED - correction;
+
+  leftRPM  = constrain(leftRPM,  0, (float)(SLOW_SPEED + MAX_CORRECTION));
+  rightRPM = constrain(rightRPM, 0, (float)(SLOW_SPEED + MAX_CORRECTION));
+
+  leftMotor.targetRPM  = leftRPM;
+  rightMotor.targetRPM = rightRPM;
+}
+
+// ================= STATE: COLLECT =================
+// Ball has left the frame — it is right in front of the robot.
+// Rollers stay on. Robot creeps straight forward.
+// Only exits when break beam confirms ball is inside.
+// No Serial.print() — runs every loop iteration.
+void doCollect() {
+  rollersOn();
+
+  if (breakBeamTriggered()) {
     hardStop();
-    lastHeadingError = 0;
-    stateEntryMs     = millis();
-    robotState       = STATE_ALIGN;
-    Serial.println("Drift -> ALIGN");
+    rollersOff();
+    stateEntryMs = millis();
+    robotState   = STATE_COLLECTED;
+    Serial.println("Break beam -> COLLECTED");
     return;
   }
 
-  leftMotor.targetRPM  = SLOW_SPEED;
-  rightMotor.targetRPM = SLOW_SPEED;
-
-  Serial.print("APPROACH | x="); Serial.println(pkt[0]);
+  leftMotor.targetRPM  = CREEP_SPEED;
+  rightMotor.targetRPM = CREEP_SPEED;
 }
 
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
 
-  pinMode(EN_PIN, OUTPUT);
-  pinMode(SF_PIN, INPUT);
+  pinMode(EN_PIN,     OUTPUT);
+  pinMode(SF_PIN,     INPUT);
+  pinMode(ROLLER_PIN, OUTPUT);
+  pinMode(BREAK_BEAM, INPUT_PULLUP);
+  
+  rollersOff();
 
   initMotor(leftMotor,  M1_DIR, M1_PWM, ENC_L, 342.0f, false);
   initMotor(rightMotor, M2_DIR, M2_PWM, ENC_R, 347.0f, false);
@@ -266,51 +281,47 @@ void setup() {
   stateEntryMs    = millis();
 
   Serial.println("=== Ball Collector Started ===");
-  Serial.print("Kp="); Serial.print(Kp_heading, 4);
-  Serial.print("  Kd="); Serial.println(Kd_heading, 4);
-  Serial.print("Dead band="); Serial.print(DEAD_BAND);
-  Serial.print("  Speed="); Serial.print(SLOW_SPEED);
-  Serial.println(" RPM");
+  Serial.print("Track speed=");    Serial.print(SLOW_SPEED);     Serial.println(" RPM");
+  Serial.print("Creep speed=");    Serial.print(CREEP_SPEED);    Serial.println(" RPM");
+  Serial.print("Max correction="); Serial.print(MAX_CORRECTION); Serial.println(" RPM");
+  Serial.print("Kp_heading=");     Serial.print(Kp_heading, 4);
+  Serial.print("  Dead band=");    Serial.println(DEAD_BAND);
   Serial.println("==============================");
 }
 
 // ================= LOOP =================
 void loop() {
-  readSerial();     // non-blocking, always runs first
+  readSerial();     // non-blocking, always first
   updateControl();  // RPM + PID, always runs
 
-  // ── Global state transitions based on ball visibility ──
+  // ── Global state transitions ──
 
+  // Ball appeared while searching → start tracking
   if (robotState == STATE_SEARCH && ballVisible()) {
     hardStop();
-    lastHeadingError = 0;
-    stateEntryMs     = millis();
-    robotState       = STATE_ALIGN;
-    Serial.println("Ball found -> ALIGN");
+    stateEntryMs = millis();
+    robotState   = STATE_TRACK;
+    Serial.println("Ball found -> TRACK");
   }
 
-  if (robotState == STATE_ALIGN && !ballVisible()) {
-    hardStop();
+  // Ball lost during tracking → ball has reached the robot, start collection
+  // (distinguished from ball never appearing by only firing from STATE_TRACK)
+  if (robotState == STATE_TRACK && !ballVisible()) {
+    rollersOn();
     stateEntryMs = millis();
-    robotState   = STATE_SEARCH;
-    Serial.println("Ball lost -> SEARCH");
-  }
-
-  if (robotState == STATE_APPROACH && !ballVisible()) {
-    hardStop();
-    stateEntryMs = millis();
-    robotState   = STATE_COLLECTED;
-    Serial.println("Ball out of frame -> COLLECTED");
+    robotState   = STATE_COLLECT;
+    Serial.println("Ball left frame -> COLLECT");
   }
 
   // ── State handlers ──
   switch (robotState) {
     case STATE_SEARCH:    doSearch();    break;
-    case STATE_ALIGN:     doAlign();     break;
-    case STATE_APPROACH:  doApproach();  break;
+    case STATE_TRACK:     doTrack();     break;
+    case STATE_COLLECT:   doCollect();   break;
 
     case STATE_COLLECTED:
       hardStop();
+      rollersOff();
       if (millis() - stateEntryMs > 2000) {
         stateEntryMs = millis();
         robotState   = STATE_SEARCH;
@@ -320,6 +331,7 @@ void loop() {
 
     case STATE_STOPPED:
       hardStop();
+      rollersOff();
       break;
   }
 }

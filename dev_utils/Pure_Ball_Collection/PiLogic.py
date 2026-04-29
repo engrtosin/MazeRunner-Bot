@@ -1,4 +1,4 @@
-import numpy as np
+mport numpy as np
 import cv2
 import serial
 
@@ -55,6 +55,7 @@ while True:
     ball_detected = False
     bx, by = 0, 0
 
+    print("Frame gotten")
     if len(contours) > 0:
         largest = max(contours, key=cv2.contourArea)
         (cx, cy), radius = cv2.minEnclosingCircle(largest)
@@ -69,27 +70,25 @@ while True:
             cv2.putText(display, f"({cx},{cy})", (cx + 10, cy - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-    # ── Send 2 bytes to Arduino only when ball detected and position changed ──
-    # Byte 0: x_byte — 0-255 mapped from pixel x in [0, FRAME_W-1]
-    # Byte 1: y_byte — 0-255 mapped from pixel y in [0, FRAME_H-1]
+    # ?? Send 2 bytes to Arduino only when ball detected and position changed ??
+    # Byte 0: x_byte ? 0-255 mapped from pixel x in [0, FRAME_W-1]
+    # Byte 1: y_byte ? 0-255 mapped from pixel y in [0, FRAME_H-1]
     # No packet sent = no ball; Arduino detects loss via timeout
     if ball_detected:
+        print("Ball detected")
         x_byte = int(np.interp(bx, [0, FRAME_W - 1], [0, 255]))
         y_byte = int(np.interp(by, [0, FRAME_H - 1], [0, 255]))
-        if abs(x_byte - last_x) > CHANGE_THRESH or abs(y_byte - last_y) > CHANGE_THRESH:
-            ser.write(bytes([x_byte, y_byte]))
-            last_x, last_y = x_byte, y_byte
-    else:
-        # Reset last position so next detection always triggers a send
-        last_x, last_y = -1, -1
+        ser.write(bytes([x_byte, y_byte]))
 
     # Status overlay
     label = f"BALL DETECTED  x={bx} y={by}" if ball_detected else "No ball (or above centerline)"
     color = (0, 255, 0) if ball_detected else (0, 0, 255)
     cv2.putText(display, label, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-    cv2.imshow("Ball Tracker", display)
     cv2.imshow("Mask", mask)
+    cv2.imshow("Ball Tracker", display)
+
+    print("Image shown")
 
     if cv2.waitKey(1) & 0xFF == 27:  # ESC
         break

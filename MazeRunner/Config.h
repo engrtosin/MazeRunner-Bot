@@ -9,6 +9,8 @@
 // ================= BOARD =================
 // Arduino UNO: Interrupt-capable pins: 2,3
 
+// ================= DEBUG =================
+#define DEBUG_SERIAL    0   // set to 0 when communicating with RPi
 
 // ================= MOTOR DRIVER PINS =================
 #define EN_PIN      4       // Motor driver enable (active HIGH)

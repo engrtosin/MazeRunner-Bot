@@ -1,96 +1,117 @@
 #pragma once
-
 // =====================================================
 // WallFollowFSM.h — MazeRunner
 //
-// Inner FSM for wall following behavior.
-// Follows the left wall using PD control.
-// Handles right turns, left turns, and U-turns.
+// State machine for wall-following behavior.
+// Follows the left wall using P control.
+// Handles right turns (inner corner) and
+// wall-lost recovery (outer corner).
 //
-// Child FSMs:
-//   TurnLeftFSM — move forward then turn left
-//   UTurnFSM    — multi-step U-turn maneuver
+// States:
+//   FOLLOW      — P correction on left distance
+//   TURN_RIGHT  — encoder-counted 90° pivot right
+//   WALL_LOST   — multi-phase outer-corner recovery
+//   STOPPED     — terminal, motors off
+//   EXIT        — terminal, maze exit detected
+//
+// Wall-lost recovery phases (sub-state of WALL_LOST):
+//   WL_REVERSE  — back up until wall reacquired or max distance
+//   WL_CREEP    — creep forward before arcing
+//   WL_ARC      — arc left until wall reacquired
 //
 // Usage:
-//   wallFollowFSM.update();   // call every loop
+//   WallFollowFSM fsm(motorLeft, motorRight, irFront, irLeft);
+//   fsm.update();   // call every loop iteration
 //
 // Dependencies:
-//   motorLeft, motorRight     — motor controllers
-//   irFront, irLeft, irRight  — IR sensors
+//   motorLeft, motorRight  — MotorController instances
+//   irFront, irLeft        — IRSensor instances
 // =====================================================
 
 #include <Arduino.h>
 #include "Config.h"
 #include "MotorController.h"
 #include "IRSensor.h"
-#include "TurnLeftFSM.h"
-#include "UTurnFSM.h"
 
 // -------------------------------------------------------
-// Wall follow states
+// Top-level robot states
 // -------------------------------------------------------
+enum class NavState : uint8_t {
+    FOLLOW,
+    TURN_RIGHT,
+    WALL_LOST,
+    STOPPED,
+    EXIT
+};
 
-enum class WallFollowState : uint8_t {
-    FOLLOW,         // PD correction on left distance, straight ahead
-    TURN_RIGHT,     // 90° right turn, inner wheel fixed
-    TURN_LEFT,      // delegate to TurnLeftFSM
-    UTURN           // delegate to UTurnFSM
+// -------------------------------------------------------
+// Wall-lost recovery sub-phases
+// -------------------------------------------------------
+enum class WallLostPhase : uint8_t {
+    WL_REVERSE,
+    WL_CREEP,
+    WL_ARC
 };
 
 // -------------------------------------------------------
 // WallFollowFSM class
 // -------------------------------------------------------
-
 class WallFollowFSM {
 public:
-
     // ---- Construction ----
     // Takes references to shared motors and sensors.
     // No dynamic allocation — all objects pre-exist as globals.
     WallFollowFSM(MotorController &motorLeft,  MotorController &motorRight,
                   IRSensor        &irFront,
-                  IRSensor        &irLeft,
-                  IRSensor        &irRight);
+                  IRSensor        &irLeft);
 
     // ---- Main update ----
-    // Call every loop iteration from RobotFSM.
+    // Call every loop iteration from MazeRunner.ino.
     void update();
 
     // ---- Accessors ----
-    WallFollowState getState() const { return _state; }
+    NavState getState() const { return _state; }
 
 private:
-
     // References to shared hardware — not owned here
     MotorController &_motorLeft;
     MotorController &_motorRight;
     IRSensor        &_irFront;
     IRSensor        &_irLeft;
-    IRSensor        &_irRight;
 
-    // Current state
-    WallFollowState _state;
+    // Current top-level state
+    NavState _state;
 
-    // Child FSMs — always allocated, only active when relevant
-    TurnLeftFSM _turnLeft;
-    UTurnFSM    _uturn;
+    // Entry timestamp — set on every state and phase transition.
+    // Each handler returns early until STATE_ENTRY_DELAY_MS has elapsed,
+    // giving the robot time to physically stop and IR filters to settle.
+    unsigned long _stateEntryMs;
 
-    // PD state for FOLLOW
-    float        _lastError;
-    unsigned long _lastPDTime;
+    // FOLLOW — P control state
+    float _lastError;
 
-    // TURN_RIGHT encoder tracking
-    int32_t _turnRightStartCount;   // encoder count at turn entry
+    // TURN_RIGHT — encoder snapshot at turn entry
+    int32_t _turnStartCountL;
+    int32_t _turnStartCountR;
 
-    // State handlers — one per state
+    // WALL_LOST — sub-phase and encoder snapshots
+    WallLostPhase _wallLostPhase;
+    int32_t       _wallLostStartL;
+    int32_t       _wallLostStartR;
+    unsigned long _arcStartMs;
+
+    // ---- State handlers ----
     void handleFollow();
     void handleTurnRight();
-    void handleTurnLeft();
-    void handleUturn();
+    void handleWallLost();
 
-    // Transition helper — resets state on entry
-    void enterState(WallFollowState newState);
+    // ---- Wall-lost phase handlers ----
+    void handleWLReverse();
+    void handleWLCreep();
+    void handleWLArc();
 
-    // Transition logic — evaluates sensor conditions
-    WallFollowState evaluateTransitions();
+    // ---- Transition helper ----
+    // Resets entry timestamp and any phase-specific state.
+    void enterState(NavState newState);
+    void enterWallLostPhase(WallLostPhase phase);
 };

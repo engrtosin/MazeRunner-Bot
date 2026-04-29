@@ -1,165 +1,292 @@
 // =====================================================
 // WallFollowFSM.cpp — MazeRunner
 // =====================================================
-
 #include "WallFollowFSM.h"
 
 // -------------------------------------------------------
 // Construction
 // -------------------------------------------------------
-
 WallFollowFSM::WallFollowFSM(MotorController &motorLeft,  MotorController &motorRight,
                                IRSensor        &irFront,
-                               IRSensor        &irLeft,
-                               IRSensor        &irRight)
+                               IRSensor        &irLeft)
     : _motorLeft(motorLeft),   _motorRight(motorRight),
       _irFront(irFront),
       _irLeft(irLeft),
-      _irRight(irRight),
-      _state(WallFollowState::FOLLOW),
-      _turnLeft(motorLeft, motorRight),
-      _uturn(motorLeft, motorRight, irFront, irLeft),
+      _state(RobotState::FOLLOW),
+      _stateEntryMs(0),
       _lastError(0.0f),
-      _lastPDTime(0),
-      _turnRightStartCount(0)
+      _turnStartCountL(0),
+      _turnStartCountR(0),
+      _wallLostPhase(WallLostPhase::WL_REVERSE),
+      _wallLostStartL(0),
+      _wallLostStartR(0),
+      _arcStartMs(0)
 {}
 
 // -------------------------------------------------------
 // Main update — runs every loop iteration
 // -------------------------------------------------------
-
 void WallFollowFSM::update() {
     switch (_state) {
-        case WallFollowState::FOLLOW:      handleFollow();     break;
-        case WallFollowState::TURN_RIGHT:  handleTurnRight();  break;
-        case WallFollowState::TURN_LEFT:   handleTurnLeft();   break;
-        case WallFollowState::UTURN:       handleUturn();      break;
+        case RobotState::FOLLOW:      handleFollow();     break;
+        case RobotState::TURN_RIGHT:  handleTurnRight();  break;
+        case RobotState::WALL_LOST:   handleWallLost();   break;
+        case RobotState::STOPPED:                         break;
+        case RobotState::EXIT:                            break;
     }
 }
 
 // -------------------------------------------------------
-// Transition evaluation
-// Called from FOLLOW to check if a state change is needed.
-// Priority order matters — dead end checked before right turn.
+// FOLLOW — P correction on left IR distance
 // -------------------------------------------------------
-
-WallFollowState WallFollowFSM::evaluateTransitions() {
-    bool frontBlocked = _irFront.getDistance() < FRONT_STOP_DIST;
-    bool rightBlocked = _irRight.getDistance() < RIGHT_STOP_DIST;
-    bool leftOpen     = _irLeft.getDistance()  > LEFT_OPEN_DIST;
-
-    // Priority 1: dead end — front AND right blocked
-    if (frontBlocked && rightBlocked) return WallFollowState::UTURN;
-
-    // Priority 2: corner — front blocked only
-    if (frontBlocked)                 return WallFollowState::TURN_RIGHT;
-
-    // Priority 3: open space to left
-    if (leftOpen)                     return WallFollowState::TURN_LEFT;
-
-    // Default: keep following
-    return WallFollowState::FOLLOW;
-}
-
-// -------------------------------------------------------
-// FOLLOW — PD correction on left IR distance
-// -------------------------------------------------------
-
 void WallFollowFSM::handleFollow() {
-    // Check for state transitions first
-    WallFollowState next = evaluateTransitions();
-    if (next != WallFollowState::FOLLOW) {
-        enterState(next);
+    if (millis() - _stateEntryMs < STATE_ENTRY_DELAY_MS) return;
+
+    float frontDist = _irFront.getDistance();
+    float leftDist  = _irLeft.getDistance();
+
+#if DEBUG_SERIAL
+    Serial.print("F: "); Serial.print(frontDist);
+    Serial.print(" | L: "); Serial.print(leftDist);
+#endif
+
+    // ── Outer corner / wall lost ──
+    if (leftDist > WALL_LOST_DIST) {
+        _motorLeft.stop();
+        _motorRight.stop();
+        _wallLostStartL = _motorLeft.getCount();
+        _wallLostStartR = _motorRight.getCount();
+        enterWallLostPhase(WallLostPhase::WL_REVERSE);
+        enterState(RobotState::WALL_LOST);
+#if DEBUG_SERIAL
+        Serial.println(" | -> WALL_LOST");
+#endif
         return;
     }
 
-    // PD wall following
-    unsigned long now = millis();
-    float dt = (now - _lastPDTime) / 1000.0f;
+    // ── Inner corner / front obstacle ──
+    if (frontDist > 0 && frontDist < FRONT_STOP_DIST) {
+        _motorLeft.stop();
+        _motorRight.stop();
+        _turnStartCountL = _motorLeft.getCount();
+        _turnStartCountR = _motorRight.getCount();
+        enterState(RobotState::TURN_RIGHT);
+#if DEBUG_SERIAL
+        Serial.println(" | -> TURN_RIGHT");
+#endif
+        return;
+    }
 
-    if (dt <= 0.0f) return;     // guard against zero dt
-    _lastPDTime = now;
+    // ── P wall-follow ──
+    float baseRPM = (frontDist > 0 && frontDist < FRONT_SLOW_DIST)
+                    ? SLOW_SPEED
+                    : BASE_SPEED;
 
-    float error      = _irLeft.getDistance() - TARGET_LEFT_DIST;
-    float derivative = (error - _lastError) / dt;
-    _lastError       = error;
+    float error      = leftDist - TARGET_LEFT_DIST;
+    float correction = constrain(WALL_KP * error, -WALL_CORRECTION_MAX, WALL_CORRECTION_MAX);
 
-    float correction = WALL_KP * error + WALL_KD * derivative;
-    correction       = constrain(correction, -WALL_CORRECTION_MAX, WALL_CORRECTION_MAX);
-
-    float leftRPM  = constrain(BASE_SPEED - correction, 0.0f, MAX_SPEED);
-    float rightRPM = constrain(BASE_SPEED + correction, 0.0f, MAX_SPEED);
+    float leftRPM  = constrain(baseRPM - correction, 0.0f, MAX_SPEED);
+    float rightRPM = constrain(baseRPM + correction, 0.0f, MAX_SPEED);
 
     _motorLeft.setTargetRPM(leftRPM);
     _motorRight.setTargetRPM(rightRPM);
+
+#if DEBUG_SERIAL
+    Serial.print(" | Err: "); Serial.print(error, 1);
+    Serial.print(" | tL: "); Serial.print(leftRPM, 1);
+    Serial.print(" | tR: "); Serial.print(rightRPM, 1);
+    Serial.print(" | aL: "); Serial.print(_motorLeft.getMeasuredRPM(), 1);
+    Serial.print(" | aR: "); Serial.println(_motorRight.getMeasuredRPM(), 1);
+#endif
 }
 
 // -------------------------------------------------------
-// TURN_RIGHT — 90° right turn, inner (right) wheel fixed
-// Completion: encoder count on outer (left) wheel reached
+// TURN_RIGHT — encoder-counted 90° pivot right
+// Left wheel forward, right wheel backward
 // -------------------------------------------------------
-
 void WallFollowFSM::handleTurnRight() {
-    // TODO: implement encoder-counted 90° right turn
-    // Left wheel drives at TURN_OUTER_RPM
-    // Right wheel holds at TURN_INNER_RPM
-    // Exit when left encoder delta >= TURN_90_PULSES
-    // enterState(WallFollowState::FOLLOW) on completion
+    if (millis() - _stateEntryMs < STATE_ENTRY_DELAY_MS) return;
 
-    // Placeholder — will be implemented when encoder counts are defined
-    enterState(WallFollowState::FOLLOW);
+    int32_t travelL = abs(_motorLeft.getCount()  - _turnStartCountL);
+    int32_t travelR = abs(_motorRight.getCount() - _turnStartCountR);
+
+#if DEBUG_SERIAL
+    Serial.print("Pivot L: "); Serial.print(travelL);
+    Serial.print(" / ");       Serial.print(TURN_COUNTS_L);
+    Serial.print(" | R: ");    Serial.print(travelR);
+    Serial.print(" / ");       Serial.println(TURN_COUNTS_R);
+#endif
+
+    if (travelL >= TURN_COUNTS_L && travelR >= TURN_COUNTS_R) {
+        _motorLeft.stop();
+        _motorRight.stop();
+        enterState(RobotState::FOLLOW);
+#if DEBUG_SERIAL
+        Serial.println("Turn complete -> FOLLOW");
+#endif
+        return;
+    }
+
+    int pwmVal = map(TURN_SPEED, 0, 20, 0, 255);
+    if (travelL < TURN_COUNTS_L) _motorLeft.setPWM( pwmVal);
+    else                         _motorLeft.setPWM(0);
+    if (travelR < TURN_COUNTS_R) _motorRight.setPWM(-pwmVal);
+    else                         _motorRight.setPWM(0);
 }
 
 // -------------------------------------------------------
-// TURN_LEFT — delegate to TurnLeftFSM
+// WALL_LOST — dispatches to active sub-phase handler
 // -------------------------------------------------------
+void WallFollowFSM::handleWallLost() {
+    switch (_wallLostPhase) {
+        case WallLostPhase::WL_REVERSE:  handleWLReverse();  break;
+        case WallLostPhase::WL_CREEP:    handleWLCreep();     break;
+        case WallLostPhase::WL_ARC:      handleWLArc();       break;
+        case WallLostPhase::WL_REALIGN:  handleWLRealign();   break;
+    }
+}
 
-void WallFollowFSM::handleTurnLeft() {
-    _turnLeft.update();
+// ── Phase 1: reverse until wall reacquired or max distance hit ──
+void WallFollowFSM::handleWLReverse() {
+    if (millis() - _stateEntryMs < STATE_ENTRY_DELAY_MS) return;
 
-    if (_turnLeft.isDone()) {
-        enterState(WallFollowState::FOLLOW);
+    int32_t travelL = abs(_motorLeft.getCount() - _wallLostStartL);
+
+#if DEBUG_SERIAL
+    Serial.print("WL_REVERSE | L_dist: "); Serial.print(_irLeft.getDistance());
+    Serial.print(" | rev_L: "); Serial.println(travelL);
+#endif
+
+    bool wallBack   = (_irLeft.getDistance() <= WALL_RECOVERY_DIST);
+    bool maxReached = (travelL >= REVERSE_MAX_COUNTS_L);
+
+    if (wallBack || maxReached) {
+        _motorLeft.stop();
+        _motorRight.stop();
+        _wallLostStartL = _motorLeft.getCount();
+        _wallLostStartR = _motorRight.getCount();
+#if DEBUG_SERIAL
+        Serial.print("  -> WL_CREEP (wallBack=");
+        Serial.print(wallBack);
+        Serial.print(", maxReached=");
+        Serial.print(maxReached);
+        Serial.println(")");
+#endif
+        enterWallLostPhase(WallLostPhase::WL_CREEP);
+        return;
+    }
+
+    int pwmVal = map(WALL_LOST_OL_SPEED, 0, 20, 0, 255);
+    _motorLeft.setPWM(-pwmVal);
+    _motorRight.setPWM(-pwmVal);
+}
+
+// ── Phase 2: creep forward a fixed distance before arcing ──
+void WallFollowFSM::handleWLCreep() {
+    if (millis() - _stateEntryMs < STATE_ENTRY_DELAY_MS) return;
+
+    int32_t creepL = abs(_motorLeft.getCount()  - _wallLostStartL);
+    int32_t creepR = abs(_motorRight.getCount() - _wallLostStartR);
+
+#if DEBUG_SERIAL
+    Serial.print("WL_CREEP | creep_L: "); Serial.print(creepL);
+    Serial.print(" / "); Serial.println(CREEP_COUNTS_L);
+#endif
+
+    if (creepL >= CREEP_COUNTS_L && creepR >= CREEP_COUNTS_R) {
+        _motorLeft.stop();
+        _motorRight.stop();
+        _arcStartMs = millis();
+#if DEBUG_SERIAL
+        Serial.println("  -> WL_ARC");
+#endif
+        enterWallLostPhase(WallLostPhase::WL_ARC);
+        return;
+    }
+
+    int pwmVal = map(WALL_LOST_OL_SPEED, 0, 20, 0, 255);
+    _motorLeft.setPWM(pwmVal);
+    _motorRight.setPWM(pwmVal);
+}
+
+// ── Phase 3: arc left until wall reacquired ──
+void WallFollowFSM::handleWLArc() {
+    if (millis() - _stateEntryMs < STATE_ENTRY_DELAY_MS) return;
+
+#if DEBUG_SERIAL
+    Serial.print("WL_ARC | L_dist: "); Serial.print(_irLeft.getDistance());
+    Serial.print(" | t_ms: "); Serial.println(millis() - _arcStartMs);
+#endif
+
+    if (_irLeft.getDistance() <= WALL_RECOVERY_DIST) {
+        _motorLeft.stop();
+        _motorRight.stop();
+        enterState(RobotState::FOLLOW);
+#if DEBUG_SERIAL
+        Serial.println("  -> FOLLOW");
+#endif
+        return;
+    }
+
+    if (millis() - _arcStartMs > ARC_TIMEOUT_MS) {
+        _motorLeft.stop();
+        _motorRight.stop();
+        enterState(RobotState::STOPPED);
+#if DEBUG_SERIAL
+        Serial.println("  WL_ARC timeout -> STOPPED");
+#endif
+        return;
+    }
+
+    // Right (outer) wheel faster, left (inner) slower → arc left
+    int outerPWM = map(ARC_OUTER_SPEED, 0, 20, 0, 255);
+    int innerPWM = map(ARC_INNER_SPEED, 0, 20, 0, 255);
+    _motorRight.setPWM(outerPWM);
+    _motorLeft.setPWM(innerPWM);
+}
+
+// ── Phase 4: drive straight briefly to settle heading (currently unused) ──
+void WallFollowFSM::handleWLRealign() {
+    if (millis() - _stateEntryMs < STATE_ENTRY_DELAY_MS) return;
+
+    int32_t straightL = abs(_motorLeft.getCount()  - _wallLostStartL);
+    int32_t straightR = abs(_motorRight.getCount() - _wallLostStartR);
+
+#if DEBUG_SERIAL
+    Serial.print("WL_REALIGN | straight_L: "); Serial.println(straightL);
+#endif
+
+    if (straightL >= REALIGN_COUNTS && straightR >= REALIGN_COUNTS) {
+        _motorLeft.stop();
+        _motorRight.stop();
+        enterState(RobotState::FOLLOW);
+#if DEBUG_SERIAL
+        Serial.println("  -> FOLLOW");
+#endif
+        return;
+    }
+
+    int pwmVal = map(SLOW_SPEED, 0, 20, 0, 255);
+    _motorLeft.setPWM(pwmVal);
+    _motorRight.setPWM(pwmVal);
+}
+
+// -------------------------------------------------------
+// enterState — resets entry timestamp for new top-level state
+// -------------------------------------------------------
+void WallFollowFSM::enterState(RobotState newState) {
+    _state        = newState;
+    _stateEntryMs = millis();
+
+    if (_state == RobotState::FOLLOW) {
+        _lastError = 0.0f;
     }
 }
 
 // -------------------------------------------------------
-// UTURN — delegate to UTurnFSM
+// enterWallLostPhase — resets entry timestamp for new sub-phase
 // -------------------------------------------------------
-
-void WallFollowFSM::handleUturn() {
-    _uturn.update();
-
-    if (_uturn.isDone()) {
-        enterState(WallFollowState::FOLLOW);
-    }
-}
-
-// -------------------------------------------------------
-// enterState — resets entry conditions for new state
-// -------------------------------------------------------
-
-void WallFollowFSM::enterState(WallFollowState newState) {
-    _state = newState;
-
-    switch (_state) {
-        case WallFollowState::FOLLOW:
-            _lastError  = 0.0f;
-            _lastPDTime = millis();
-            break;
-
-        case WallFollowState::TURN_RIGHT:
-            // TODO: snapshot left encoder count here for delta tracking
-            // _turnRightStartCount = atomically read left motor pulse count
-            _motorLeft.setTargetRPM(TURN_OUTER_RPM);
-            _motorRight.setTargetRPM(TURN_INNER_RPM);
-            break;
-
-        case WallFollowState::TURN_LEFT:
-            _turnLeft.start();
-            break;
-
-        case WallFollowState::UTURN:
-            _uturn.start();
-            break;
-    }
+void WallFollowFSM::enterWallLostPhase(WallLostPhase phase) {
+    _wallLostPhase = phase;
+    _stateEntryMs  = millis();
 }

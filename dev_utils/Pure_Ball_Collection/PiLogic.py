@@ -3,12 +3,8 @@ import cv2
 import serial
 
 # ================= CONFIG =================
-FRAME_W = 480
-FRAME_H = 360
-MIN_RADIUS = 10
-
-CENTERLINE_Y = FRAME_H // 2
-CENTERLINE_X = FRAME_W // 2
+MIN_RADIUS      = 10
+CHANGE_THRESH   = 3   # minimum change in 0-255 space before sending
 
 # Serial
 ser = serial.Serial('/dev/ttyACM0', 115200, timeout=0.01)
@@ -19,14 +15,23 @@ upper_ball = np.array([60, 255, 255])
 
 # ================= CAMERA =================
 cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-cap.set(3, FRAME_W)
-cap.set(4, FRAME_H)
 
 # Send activation byte to Arduino
 ser.write(bytes([255]))
 
+# Grab one frame to determine actual frame dimensions
+grabbed, frame = cap.read()
+if not grabbed:
+    raise RuntimeError("Camera not available")
+
+FRAME_H, FRAME_W = frame.shape[:2]
+CENTERLINE_Y = FRAME_H // 2
+CENTERLINE_X = FRAME_W // 2
+
 print("=== Ball Tracker Started ===")
 print(f"Frame: {FRAME_W}x{FRAME_H} | Centerline X: {CENTERLINE_X} | Centerline Y: {CENTERLINE_Y}")
+
+last_x, last_y = -1, -1
 
 while True:
     grabbed, frame = cap.read()
@@ -35,14 +40,14 @@ while True:
 
     display = frame.copy()
 
-    # Draw crosshairs on display frame
-    cv2.line(display, (CENTERLINE_X, 0), (CENTERLINE_X, FRAME_H), (255, 255, 0), 1)  # vertical - cyan
-    cv2.line(display, (0, CENTERLINE_Y), (FRAME_W, CENTERLINE_Y), (255, 255, 0), 1)  # horizontal - cyan
+    # Draw crosshairs
+    cv2.line(display, (CENTERLINE_X, 0), (CENTERLINE_X, FRAME_H), (255, 255, 0), 1)
+    cv2.line(display, (0, CENTERLINE_Y), (FRAME_W, CENTERLINE_Y), (255, 255, 0), 1)
 
     # HSV processing
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, lower_ball, upper_ball)
-    mask = cv2.erode(mask, None, iterations=2)
+    mask = cv2.erode(mask,  None, iterations=2)
     mask = cv2.dilate(mask, None, iterations=2)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -55,30 +60,28 @@ while True:
         (cx, cy), radius = cv2.minEnclosingCircle(largest)
         cx, cy, radius = int(cx), int(cy), int(radius)
 
-        # Ball is valid only if:
-        #   1. Radius meets minimum size
-        #   2. Circle center (y-coordinate) is on or below the horizontal centerline
+        # Valid ball: radius large enough AND center at or below horizontal centerline
         if radius > MIN_RADIUS and cy >= CENTERLINE_Y:
             ball_detected = True
             bx, by = cx, cy
-
             cv2.circle(display, (cx, cy), int(radius), (0, 255, 0), 2)
             cv2.circle(display, (cx, cy), 3, (0, 0, 255), -1)
             cv2.putText(display, f"({cx},{cy})", (cx + 10, cy - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-    # ── Pack and send 3 bytes to Arduino ──
-    # Byte 0: status — 0=no ball, 1=ball detected
-    # Byte 1: x_byte — 0-255 mapped from pixel x in range [0, FRAME_W-1]
-    # Byte 2: y_byte — 0-255 mapped from pixel y in range [0, FRAME_H-1]
+    # ── Send 2 bytes to Arduino only when ball detected and position changed ──
+    # Byte 0: x_byte — 0-255 mapped from pixel x in [0, FRAME_W-1]
+    # Byte 1: y_byte — 0-255 mapped from pixel y in [0, FRAME_H-1]
+    # No packet sent = no ball; Arduino detects loss via timeout
     if ball_detected:
-        status = 1
         x_byte = int(np.interp(bx, [0, FRAME_W - 1], [0, 255]))
         y_byte = int(np.interp(by, [0, FRAME_H - 1], [0, 255]))
+        if abs(x_byte - last_x) > CHANGE_THRESH or abs(y_byte - last_y) > CHANGE_THRESH:
+            ser.write(bytes([x_byte, y_byte]))
+            last_x, last_y = x_byte, y_byte
     else:
-        status, x_byte, y_byte = 0, 0, 0
-
-    ser.write(bytes([status, x_byte, y_byte]))
+        # Reset last position so next detection always triggers a send
+        last_x, last_y = -1, -1
 
     # Status overlay
     label = f"BALL DETECTED  x={bx} y={by}" if ball_detected else "No ball (or above centerline)"

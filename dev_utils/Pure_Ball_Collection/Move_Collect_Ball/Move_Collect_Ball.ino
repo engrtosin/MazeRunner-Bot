@@ -1,17 +1,15 @@
 // =============================================================
 //  Ball Tracker + Collector — Arduino
-//  Protocol (3 bytes from RPi, 115200 baud):
-//    [0] status : 0 = no ball, 1 = ball detected below centerline
-//    [1] x_byte : 0-255 mapped from pixel x 0-(FRAME_W-1)
-//    [2] y_byte : 0-255 mapped from pixel y 0-(FRAME_H-1)
 //
-//  Ball detection rule (enforced on RPi):
-//    Valid only when circle radius > MIN_RADIUS AND
-//    circle center y-pixel >= frame horizontal centerline.
+//  Serial protocol (RPi -> Arduino, 115200 baud):
+//    2 bytes sent ONLY when ball detected AND position changed:
+//      [0] x_byte : 0-255 mapped from pixel x
+//      [1] y_byte : 0-255 mapped from pixel y
 //
-//  Collection trigger:
-//    Ball transitions from detected → not detected while robot
-//    is in APPROACH state (ball drove out of the bottom of frame).
+//    No packet = no ball. Arduino detects ball loss via timeout.
+//
+//  readSerial() is fully non-blocking — it only reads bytes
+//  already in the buffer and never stalls the control loop.
 // =============================================================
 
 // ================= PIN DEFINITIONS =================
@@ -54,30 +52,36 @@ unsigned long stateEntryMs = 0;
 
 // ================= SPEEDS =================
 #define SLOW_SPEED   7    // RPM — forward toward ball
-#define ALIGN_SPEED  5    // RPM — outer wheel during pivot alignment
+#define ALIGN_SPEED  5    // RPM — pivot during heading correction
 
 // ================= PD HEADING CORRECTION =================
-// x_byte range 0-255; centre = 127
-#define X_CENTER   127
-#define DEAD_BAND    8    // ± tolerance in 0-255 x space (~±6 px on 480-wide frame)
+#define X_CENTER   127    // midpoint of 0-255 x space
+#define DEAD_BAND    8    // ± tolerance (~±6 px on 480-wide frame)
 
 float lastHeadingError = 0.0f;
-float Kp_heading       = 0.020f;  // tune: increase to turn faster
-float Kd_heading       = 0.008f;  // tune: increase to damp oscillation
+float Kp_heading       = 0.020f;
+float Kd_heading       = 0.008f;
+
+// ================= BALL TIMEOUT =================
+#define BALL_TIMEOUT_MS 300   // no packet for this long = ball lost
+
+unsigned long lastPacketMs = 0;
+uint8_t pkt[2] = {0, 0};     // [0]=x_byte, [1]=y_byte
+
+bool ballVisible() {
+  return (millis() - lastPacketMs < BALL_TIMEOUT_MS);
+}
 
 // ================= STATE MACHINE =================
 enum RobotState {
-  STATE_SEARCH,     // waiting for ball to appear below centerline
+  STATE_SEARCH,     // waiting for ball
   STATE_ALIGN,      // PD pivot to centre ball horizontally
-  STATE_APPROACH,   // drive straight; ball disappearing = collected
-  STATE_COLLECTED,  // ball reached — stop briefly then reset
+  STATE_APPROACH,   // drive straight; ball timeout = collected
+  STATE_COLLECTED,  // brief pause then back to search
   STATE_STOPPED
 };
 
 RobotState robotState = STATE_SEARCH;
-
-// ================= SERIAL PACKET =================
-uint8_t pkt[3] = {0, 0, 0};
 
 // ================= ENCODER ISR =================
 void leftISR()  { leftMotor.count++; }
@@ -157,36 +161,34 @@ void updateControl() {
   lastControlTime = now;
   updateRPM(leftMotor,  dt);
   updateRPM(rightMotor, dt);
-  // PID runs only while wheels should be tracking a target RPM
   if (robotState == STATE_APPROACH) {
     updatePID(leftMotor,  dt);
     updatePID(rightMotor, dt);
   }
 }
 
-// ================= SERIAL READ =================
-// Non-blocking: consumes exactly 3 bytes when available.
-// Returns true when a fresh packet is ready.
-bool readPacket() {
-  if (Serial.available() >= 3) {
-    Serial.readBytes((char*)pkt, 3);
-    return true;
+// ================= SERIAL READ (NON-BLOCKING) =================
+// Drains all complete 2-byte packets from the buffer each call,
+// keeping only the most recent. Never waits for bytes — if fewer
+// than 2 are available it returns immediately.
+void readSerial() {
+  while (Serial.available() >= 2) {
+    pkt[0] = Serial.read();  // x_byte
+    pkt[1] = Serial.read();  // y_byte
+    lastPacketMs = millis();
   }
-  return false;
 }
 
 // ================= STATE: SEARCH =================
 void doSearch() {
   hardStop();
-  // Robot sits still; state transitions are handled in loop()
 }
 
 // ================= STATE: ALIGN =================
-// PD pivot-in-place until ball x is within DEAD_BAND of centre.
-void doAlign(uint8_t x_byte) {
+void doAlign() {
   if (millis() - stateEntryMs < STATE_ENTRY_DELAY_MS) return;
 
-  float error = (float)x_byte - (float)X_CENTER; // +ve = ball to the right
+  float error = (float)pkt[0] - (float)X_CENTER;  // +ve = ball to the right
 
   float dt         = (float)intervalMs / 1000.0f;
   float derivative = (error - lastHeadingError) / dt;
@@ -204,7 +206,6 @@ void doAlign(uint8_t x_byte) {
     return;
   }
 
-  // Scale PWM proportionally to correction magnitude
   int maxPWM  = map(ALIGN_SPEED, 0, 20, 0, 255);
   int corrPWM = (int)(abs(correction) / (float)ALIGN_SPEED * maxPWM);
   corrPWM = constrain(corrPWM, 0, maxPWM);
@@ -219,33 +220,30 @@ void doAlign(uint8_t x_byte) {
     setMotorPWM(rightMotor,  corrPWM);
   }
 
-  Serial.print("ALIGN | x="); Serial.print(x_byte);
+  Serial.print("ALIGN | x="); Serial.print(pkt[0]);
   Serial.print(" err="); Serial.print(error, 1);
   Serial.print(" corr="); Serial.println(correction, 3);
 }
 
 // ================= STATE: APPROACH =================
-// Drive straight at SLOW_SPEED.
-// Re-align if heading drifts beyond 2×DEAD_BAND.
-// Ball disappearing (status=0) while approaching means it has been collected.
-void doApproach(uint8_t x_byte) {
+void doApproach() {
   if (millis() - stateEntryMs < STATE_ENTRY_DELAY_MS) return;
 
-  // Mid-approach heading drift check
-  float error = (float)x_byte - (float)X_CENTER;
+  // Re-align if heading drifts
+  float error = (float)pkt[0] - (float)X_CENTER;
   if (abs(error) > DEAD_BAND * 2) {
     hardStop();
     lastHeadingError = 0;
     stateEntryMs     = millis();
     robotState       = STATE_ALIGN;
-    Serial.println("Drift detected -> ALIGN");
+    Serial.println("Drift -> ALIGN");
     return;
   }
 
   leftMotor.targetRPM  = SLOW_SPEED;
   rightMotor.targetRPM = SLOW_SPEED;
 
-  Serial.print("APPROACH | x="); Serial.println(x_byte);
+  Serial.print("APPROACH | x="); Serial.println(pkt[0]);
 }
 
 // ================= SETUP =================
@@ -268,27 +266,22 @@ void setup() {
   stateEntryMs    = millis();
 
   Serial.println("=== Ball Collector Started ===");
-  Serial.print("Kp_heading="); Serial.print(Kp_heading, 4);
-  Serial.print("  Kd_heading="); Serial.println(Kd_heading, 4);
+  Serial.print("Kp="); Serial.print(Kp_heading, 4);
+  Serial.print("  Kd="); Serial.println(Kd_heading, 4);
   Serial.print("Dead band="); Serial.print(DEAD_BAND);
-  Serial.print("  Approach speed="); Serial.print(SLOW_SPEED);
+  Serial.print("  Speed="); Serial.print(SLOW_SPEED);
   Serial.println(" RPM");
   Serial.println("==============================");
 }
 
 // ================= LOOP =================
 void loop() {
-  updateControl();
-  readPacket();   // always drain serial buffer; pkt[] holds latest values
+  readSerial();     // non-blocking, always runs first
+  updateControl();  // RPM + PID, always runs
 
-  bool    ballVisible = (pkt[0] == 1);
-  uint8_t x_byte     = pkt[1];
-  // pkt[2] = y_byte available for future use / debug
+  // ── Global state transitions based on ball visibility ──
 
-  // ── Global state transitions ──
-
-  // Ball appeared while searching → start aligning
-  if (robotState == STATE_SEARCH && ballVisible) {
+  if (robotState == STATE_SEARCH && ballVisible()) {
     hardStop();
     lastHeadingError = 0;
     stateEntryMs     = millis();
@@ -296,16 +289,14 @@ void loop() {
     Serial.println("Ball found -> ALIGN");
   }
 
-  // Ball disappeared during align → back to search
-  if (robotState == STATE_ALIGN && !ballVisible) {
+  if (robotState == STATE_ALIGN && !ballVisible()) {
     hardStop();
     stateEntryMs = millis();
     robotState   = STATE_SEARCH;
-    Serial.println("Ball lost during ALIGN -> SEARCH");
+    Serial.println("Ball lost -> SEARCH");
   }
 
-  // Ball disappeared during approach → collected (drove out of frame)
-  if (robotState == STATE_APPROACH && !ballVisible) {
+  if (robotState == STATE_APPROACH && !ballVisible()) {
     hardStop();
     stateEntryMs = millis();
     robotState   = STATE_COLLECTED;
@@ -314,22 +305,12 @@ void loop() {
 
   // ── State handlers ──
   switch (robotState) {
-
-    case STATE_SEARCH:
-      doSearch();
-      break;
-
-    case STATE_ALIGN:
-      doAlign(x_byte);
-      break;
-
-    case STATE_APPROACH:
-      doApproach(x_byte);
-      break;
+    case STATE_SEARCH:    doSearch();    break;
+    case STATE_ALIGN:     doAlign();     break;
+    case STATE_APPROACH:  doApproach();  break;
 
     case STATE_COLLECTED:
       hardStop();
-      // Brief pause, then reset to look for the next ball
       if (millis() - stateEntryMs > 2000) {
         stateEntryMs = millis();
         robotState   = STATE_SEARCH;

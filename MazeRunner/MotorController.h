@@ -1,5 +1,4 @@
 #pragma once
-
 // =====================================================
 // MotorController.h — MazeRunner
 //
@@ -7,7 +6,7 @@
 // Owns all encoder state. Instantiate as a global.
 //
 // Usage:
-//   motorLeft.init(M1_DIR, M1_PWM, ENC_L, MOTOR_KP, MOTOR_KI);
+//   motorLeft.init(M1_DIR, M1_PWM, ENC_L, CPR_L, false, MOTOR_KP, MOTOR_KI);
 //   motorLeft.setTargetRPM(15.0f);
 //   motorLeft.update(dt);   // call every control interval
 //
@@ -21,7 +20,6 @@
 
 class MotorController {
 public:
-
     // ---- Construction ----
     MotorController();
 
@@ -30,6 +28,7 @@ public:
     // encPin must be interrupt-capable (pin 2 or 3 on Uno R3).
     // attachInterrupt() stays in .ino — Arduino ISR constraint.
     void init(uint8_t dirPin, uint8_t pwmPin, uint8_t encPin,
+              float cpr, bool invertDir,
               float kp, float ki);
 
     // ---- ISR callback ----
@@ -44,8 +43,13 @@ public:
     void update(float dt);
 
     // ---- Commands ----
-    void setTargetRPM(float rpm);   // positive = forward, negative = reverse
+    void setTargetRPM(float rpm);   // positive = forward only under PI
     void stop();                    // immediate stop — clears integral & PWM
+
+    // ---- Open-loop direct PWM ----
+    // Bypasses PI — used for pivot turns and wall-lost recovery.
+    // Pass positive for forward, negative for reverse.
+    void setPWM(float pwm);
 
     // ---- Telemetry ----
     float   getMeasuredRPM() const { return _measuredRPM; }
@@ -53,12 +57,19 @@ public:
     float   getPWM()         const { return _pwm;         }
     uint8_t getEncPin()      const { return _encPin;      }
 
-private:
+    // ---- Encoder count ----
+    // Raw cumulative pulse count — used by FSM for dead-reckoning.
+    int32_t getCount() const { return _pulseCount; }
 
+private:
     // Pins
     uint8_t _dirPin;
     uint8_t _pwmPin;
-    uint8_t _encPin;        // stored so init() can configure INPUT_PULLUP
+    uint8_t _encPin;
+
+    // Motor geometry
+    float _cpr;          // counts per revolution (per-motor, e.g. 342 vs 347)
+    bool  _invertDir;    // flip forward/reverse if motor is wired backwards
 
     // PI gains
     float _kp;
@@ -78,6 +89,6 @@ private:
 
     // Internal helpers
     void computeRPM(float dt);
-    void computePI();
+    void computePI(float dt);
     void applyPWM(float pwm);
 };

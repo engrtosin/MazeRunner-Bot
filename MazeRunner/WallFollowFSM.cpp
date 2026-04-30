@@ -12,7 +12,7 @@ WallFollowFSM::WallFollowFSM(MotorController &motorLeft,  MotorController &motor
     : _motorLeft(motorLeft),   _motorRight(motorRight),
       _irFront(irFront),
       _irLeft(irLeft),
-      _state(RobotState::FOLLOW),
+      _state(NavState::FOLLOW),
       _stateEntryMs(0),
       _lastError(0.0f),
       _turnStartCountL(0),
@@ -28,11 +28,11 @@ WallFollowFSM::WallFollowFSM(MotorController &motorLeft,  MotorController &motor
 // -------------------------------------------------------
 void WallFollowFSM::update() {
     switch (_state) {
-        case RobotState::FOLLOW:      handleFollow();     break;
-        case RobotState::TURN_RIGHT:  handleTurnRight();  break;
-        case RobotState::WALL_LOST:   handleWallLost();   break;
-        case RobotState::STOPPED:                         break;
-        case RobotState::EXIT:                            break;
+        case NavState::FOLLOW:      handleFollow();     break;
+        case NavState::TURN_RIGHT:  handleTurnRight();  break;
+        case NavState::WALL_LOST:   handleWallLost();   break;
+        case NavState::STOPPED:                         break;
+        case NavState::EXIT:                            break;
     }
 }
 
@@ -57,7 +57,7 @@ void WallFollowFSM::handleFollow() {
         _wallLostStartL = _motorLeft.getCount();
         _wallLostStartR = _motorRight.getCount();
         enterWallLostPhase(WallLostPhase::WL_REVERSE);
-        enterState(RobotState::WALL_LOST);
+        enterState(NavState::WALL_LOST);
 #if DEBUG_SERIAL
         Serial.println(" | -> WALL_LOST");
 #endif
@@ -70,7 +70,7 @@ void WallFollowFSM::handleFollow() {
         _motorRight.stop();
         _turnStartCountL = _motorLeft.getCount();
         _turnStartCountR = _motorRight.getCount();
-        enterState(RobotState::TURN_RIGHT);
+        enterState(NavState::TURN_RIGHT);
 #if DEBUG_SERIAL
         Serial.println(" | -> TURN_RIGHT");
 #endif
@@ -120,7 +120,7 @@ void WallFollowFSM::handleTurnRight() {
     if (travelL >= TURN_COUNTS_L && travelR >= TURN_COUNTS_R) {
         _motorLeft.stop();
         _motorRight.stop();
-        enterState(RobotState::FOLLOW);
+        enterState(NavState::FOLLOW);
 #if DEBUG_SERIAL
         Serial.println("Turn complete -> FOLLOW");
 #endif
@@ -221,7 +221,7 @@ void WallFollowFSM::handleWLArc() {
     if (_irLeft.getDistance() <= WALL_RECOVERY_DIST) {
         _motorLeft.stop();
         _motorRight.stop();
-        enterState(RobotState::FOLLOW);
+        enterState(NavState::FOLLOW);
 #if DEBUG_SERIAL
         Serial.println("  -> FOLLOW");
 #endif
@@ -231,7 +231,7 @@ void WallFollowFSM::handleWLArc() {
     if (millis() - _arcStartMs > ARC_TIMEOUT_MS) {
         _motorLeft.stop();
         _motorRight.stop();
-        enterState(RobotState::STOPPED);
+        enterState(NavState::STOPPED);
 #if DEBUG_SERIAL
         Serial.println("  WL_ARC timeout -> STOPPED");
 #endif
@@ -259,7 +259,7 @@ void WallFollowFSM::handleWLRealign() {
     if (straightL >= REALIGN_COUNTS && straightR >= REALIGN_COUNTS) {
         _motorLeft.stop();
         _motorRight.stop();
-        enterState(RobotState::FOLLOW);
+        enterState(NavState::FOLLOW);
 #if DEBUG_SERIAL
         Serial.println("  -> FOLLOW");
 #endif
@@ -274,11 +274,11 @@ void WallFollowFSM::handleWLRealign() {
 // -------------------------------------------------------
 // enterState — resets entry timestamp for new top-level state
 // -------------------------------------------------------
-void WallFollowFSM::enterState(RobotState newState) {
+void WallFollowFSM::enterState(NavState newState) {
     _state        = newState;
     _stateEntryMs = millis();
 
-    if (_state == RobotState::FOLLOW) {
+    if (_state == NavState::FOLLOW) {
         _lastError = 0.0f;
     }
 }

@@ -8,10 +8,14 @@
 //                      then resumes wall-following automatically.
 //
 //  RPi → Arduino serial protocol (115200 baud):
-//    2 bytes per detected ball frame:
-//      [0] x_byte : 0-255 mapped from pixel x
-//      [1] y_byte : 0-255 mapped from pixel y
+//    3 bytes per detected ball frame:
+//      [0] 0xFF   : header / sync byte
+//      [1] x_byte : 0-255 mapped from pixel x (clamped to 0-254)
+//      [2] y_byte : 0-255 mapped from pixel y (clamped to 0-254)
 //    Silence for > BALL_TIMEOUT_MS → ball lost.
+//    Arduino re-syncs by scanning for 0xFF, so stale debug bytes
+//    cannot cause misalignment. x/y bytes are clamped to 0-254
+//    so they never accidentally look like the header.
 // =============================================================
 
 // ================= PIN DEFINITIONS =================
@@ -278,8 +282,16 @@ void updateControl() {
 }
 
 // ================= SERIAL READ (NON-BLOCKING) =================
+// Protocol: 3-byte packets  [ 0xFF | x_byte | y_byte ]
+// The header byte 0xFF lets us re-sync after any framing error or
+// leftover bytes from the Serial debug stream.
 void readSerial() {
-  while (Serial.available() >= 2) {
+  while (Serial.available() >= 3) {
+    if (Serial.peek() != 0xFF) {
+      Serial.read();   // discard until aligned to header
+      continue;
+    }
+    Serial.read();           // consume 0xFF header
     pkt[0] = Serial.read();  // x_byte
     pkt[1] = Serial.read();  // y_byte
     lastPacketMs = millis();
@@ -305,7 +317,7 @@ void doWallFollow() {
     wallLostStartR = rightMotor.count;
     stateEntryMs   = millis();
     robotState     = STATE_WALL_LOST;
-    Serial.println("WF | -> WALL_LOST");
+    // Serial.println("WF | -> WALL_LOST");
     return;
   }
 
@@ -316,7 +328,7 @@ void doWallFollow() {
     turnStartCountR = rightMotor.count;
     stateEntryMs    = millis();
     robotState      = STATE_TURNING;
-    Serial.println("WF | -> TURNING");
+    // Serial.println("WF | -> TURNING");
     return;
   }
 
@@ -340,7 +352,7 @@ void doTurning() {
     hardStop();
     stateEntryMs = millis();
     robotState   = STATE_WALL_FOLLOW;
-    Serial.println("Turn complete -> WALL_FOLLOW");
+    // Serial.println("Turn complete -> WALL_FOLLOW");
     return;
   }
 
@@ -365,7 +377,7 @@ void doWallLost() {
         wallLostStartR = rightMotor.count;
         wallLostPhase  = WL_CREEP;
         stateEntryMs   = millis();
-        Serial.println("WL | -> WL_CREEP");
+        // Serial.println("WL | -> WL_CREEP");
         return;
       }
       int pwmVal = map(WALL_LOST_OL_SPEED, 0, 20, 0, 255);
@@ -382,7 +394,7 @@ void doWallLost() {
         arcStartMs    = millis();
         wallLostPhase = WL_ARC;
         stateEntryMs  = millis();
-        Serial.println("WL | -> WL_ARC");
+        // Serial.println("WL | -> WL_ARC");
         return;
       }
       int pwmVal = map(WALL_LOST_OL_SPEED, 0, 20, 0, 255);
@@ -396,13 +408,13 @@ void doWallLost() {
         hardStop();
         stateEntryMs = millis();
         robotState   = STATE_WALL_FOLLOW;
-        Serial.println("WL | -> WALL_FOLLOW");
+        // Serial.println("WL | -> WALL_FOLLOW");
         return;
       }
       if (millis() - arcStartMs > ARC_TIMEOUT_MS) {
         hardStop();
         robotState = STATE_STOPPED;
-        Serial.println("WL | ARC timeout -> STOPPED");
+        // Serial.println("WL | ARC timeout -> STOPPED");
         return;
       }
       setMotorPWM(rightMotor, map(ARC_OUTER_SPEED, 0, 20, 0, 255));
@@ -417,7 +429,7 @@ void doWallLost() {
         hardStop();
         stateEntryMs = millis();
         robotState   = STATE_WALL_FOLLOW;
-        Serial.println("WL | -> WALL_FOLLOW");
+        // Serial.println("WL | -> WALL_FOLLOW");
         return;
       }
       int pwmVal = map(SLOW_SPEED_WF, 0, 20, 0, 255);
@@ -443,7 +455,7 @@ void doBallOverride() {
         hardStop();
         ballPhase   = BP_COLLECT;
         ballPhaseMs = millis();
-        Serial.println("Ball | frame exit -> BP_COLLECT");
+        // Serial.println("Ball | frame exit -> BP_COLLECT");
         return;
       }
 
@@ -470,7 +482,7 @@ void doBallOverride() {
         rollersOff();
         ballPhase   = BP_COLLECTED;
         ballPhaseMs = millis();
-        Serial.println("Ball | break beam -> BP_COLLECTED");
+        // Serial.println("Ball | break beam -> BP_COLLECTED");
         return;
       }
 
@@ -480,7 +492,7 @@ void doBallOverride() {
         rollersOff();
         ballPhase   = BP_COLLECTED;
         ballPhaseMs = millis();
-        Serial.println("Ball | collect timeout -> BP_COLLECTED");
+        // Serial.println("Ball | collect timeout -> BP_COLLECTED");
         return;
       }
 
@@ -500,7 +512,7 @@ void doBallOverride() {
 
         stateEntryMs = millis();
         robotState   = STATE_WALL_FOLLOW;
-        Serial.println("Ball | done -> WALL_FOLLOW");
+        // Serial.println("Ball | done -> WALL_FOLLOW");
       }
       break;
     }
@@ -562,7 +574,7 @@ void loop() {
     ballPhase   = BP_TRACK;
     ballPhaseMs = millis();
     robotState  = STATE_BALL_OVERRIDE;
-    Serial.println("Ball detected -> BALL_OVERRIDE");
+    // Serial.println("Ball detected -> BALL_OVERRIDE");
   }
 
   // ── State dispatch ───────────────────────────────────────────────

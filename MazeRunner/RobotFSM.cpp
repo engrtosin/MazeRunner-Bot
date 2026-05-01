@@ -30,7 +30,7 @@ void RobotFSM::update() {
             // _wallFollow.suspend() before enterState(BALL_OVERRIDE)
             // and _wallFollow.resume() on return.
             if (_rpiComms.isBallVisible() &&
-                _wallFollow.getState() == RobotState::FOLLOW) {
+                _wallFollow.getState() == NavState::FOLLOW) {
                 _motorLeft.stop();
                 _motorRight.stop();
                 enterState(TopState::BALL_OVERRIDE);

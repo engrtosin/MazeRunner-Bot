@@ -33,6 +33,8 @@
 #define FRONT_IR_PIN    A2
 #define LEFT_IR_PIN     A3
 
+// ================= ROLLER PIN =====================
+#define ROLLER_PIN      5
 
 // ================= BREAK BEAM PIN =================
 #define BREAK_BEAM_PIN  A5   // Digital input, INPUT_PULLUP

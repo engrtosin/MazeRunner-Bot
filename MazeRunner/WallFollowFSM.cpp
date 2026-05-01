@@ -142,7 +142,6 @@ void WallFollowFSM::handleWallLost() {
         case WallLostPhase::WL_REVERSE:  handleWLReverse();  break;
         case WallLostPhase::WL_CREEP:    handleWLCreep();     break;
         case WallLostPhase::WL_ARC:      handleWLArc();       break;
-        case WallLostPhase::WL_REALIGN:  handleWLRealign();   break;
     }
 }
 
@@ -243,32 +242,6 @@ void WallFollowFSM::handleWLArc() {
     int innerPWM = map(ARC_INNER_SPEED, 0, 20, 0, 255);
     _motorRight.setPWM(outerPWM);
     _motorLeft.setPWM(innerPWM);
-}
-
-// ── Phase 4: drive straight briefly to settle heading (currently unused) ──
-void WallFollowFSM::handleWLRealign() {
-    if (millis() - _stateEntryMs < STATE_ENTRY_DELAY_MS) return;
-
-    int32_t straightL = abs(_motorLeft.getCount()  - _wallLostStartL);
-    int32_t straightR = abs(_motorRight.getCount() - _wallLostStartR);
-
-#if DEBUG_SERIAL
-    Serial.print("WL_REALIGN | straight_L: "); Serial.println(straightL);
-#endif
-
-    if (straightL >= REALIGN_COUNTS && straightR >= REALIGN_COUNTS) {
-        _motorLeft.stop();
-        _motorRight.stop();
-        enterState(NavState::FOLLOW);
-#if DEBUG_SERIAL
-        Serial.println("  -> FOLLOW");
-#endif
-        return;
-    }
-
-    int pwmVal = map(SLOW_SPEED, 0, 20, 0, 255);
-    _motorLeft.setPWM(pwmVal);
-    _motorRight.setPWM(pwmVal);
 }
 
 // -------------------------------------------------------

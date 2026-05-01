@@ -49,7 +49,13 @@ void WallFollowFSM::handleFollow() {
     Serial.print("F: "); Serial.print(frontDist);
     Serial.print(" | L: "); Serial.print(leftDist);
 #endif
-
+    if (leftDist > EXIT_LEFT_DIST && frontDist > EXIT_FRONT_DIST) {
+       _motorLeft.stop();
+       _motorRight.stop();
+       enterState(NavState::EXIT);
+       return;
+    }
+  
     // ── Outer corner / wall lost ──
     if (leftDist > WALL_LOST_DIST) {
         _motorLeft.stop();

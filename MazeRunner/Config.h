@@ -82,6 +82,10 @@ inline bool breakBeamTriggered() {
 #define WALL_RECOVERY_DIST  30.0f       // Left reading below this → wall reacquired (cm)
 #define WALL_CORRECTION_MAX 5.0f        // Max RPM correction from PD (clamp)
 
+// ================= EXIT THRESHOLDS =================
+#define EXIT_LEFT_DIST   100.0f   // left IR must read > this
+#define EXIT_FRONT_DIST  400.0f   // front IR must read > this
+
 
 // ================= IR CALIBRATION =================
 // Personal note: We use our sensor 2 for front and sensor 1 for left.

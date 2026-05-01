@@ -70,6 +70,15 @@ void setup() {
     digitalWrite(EN_PIN, HIGH); delay(5);
 
     delay(2000);    // IR sensor stabilisation
+    // irFront.begin();
+    // irLeft.begin();
+
+    // Warm up IR filters before main loop starts
+    for (int i = 0; i < 30; i++) {
+        irFront.update();
+        irLeft.update();
+        delay(10);   // match your normal IR sample interval
+    }
 
     lastControlMs = millis();
 

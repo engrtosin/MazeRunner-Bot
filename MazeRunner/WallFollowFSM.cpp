@@ -4,7 +4,7 @@
 #include "WallFollowFSM.h"
 
 // -------------------------------------------------------
-// Construction
+// Construction — added _suspended and _arcElapsedAtSuspend
 // -------------------------------------------------------
 WallFollowFSM::WallFollowFSM(MotorController &motorLeft,  MotorController &motorRight,
                                IRSensor        &irFront,
@@ -20,13 +20,17 @@ WallFollowFSM::WallFollowFSM(MotorController &motorLeft,  MotorController &motor
       _wallLostPhase(WallLostPhase::WL_REVERSE),
       _wallLostStartL(0),
       _wallLostStartR(0),
-      _arcStartMs(0)
+      _arcStartMs(0),
+      _suspended(false),
+      _arcElapsedAtSuspend(0)
 {}
 
 // -------------------------------------------------------
-// Main update — runs every loop iteration
+// Main update — guard at top so FSM goes inert while suspended
 // -------------------------------------------------------
 void WallFollowFSM::update() {
+    if (_suspended) return;
+
     switch (_state) {
         case NavState::FOLLOW:      handleFollow();     break;
         case NavState::TURN_RIGHT:  handleTurnRight();  break;
@@ -37,7 +41,7 @@ void WallFollowFSM::update() {
 }
 
 // -------------------------------------------------------
-// FOLLOW — P correction on left IR distance
+// FOLLOW — unchanged
 // -------------------------------------------------------
 void WallFollowFSM::handleFollow() {
     if (millis() - _stateEntryMs < STATE_ENTRY_DELAY_MS) return;
@@ -55,8 +59,7 @@ void WallFollowFSM::handleFollow() {
        enterState(NavState::EXIT);
        return;
     }
-  
-    // ── Outer corner / wall lost ──
+
     if (leftDist > WALL_LOST_DIST) {
         _motorLeft.stop();
         _motorRight.stop();
@@ -70,7 +73,6 @@ void WallFollowFSM::handleFollow() {
         return;
     }
 
-    // ── Inner corner / front obstacle ──
     if (frontDist > 0 && frontDist < FRONT_STOP_DIST) {
         _motorLeft.stop();
         _motorRight.stop();
@@ -83,7 +85,6 @@ void WallFollowFSM::handleFollow() {
         return;
     }
 
-    // ── P wall-follow ──
     float baseRPM = (frontDist > 0 && frontDist < FRONT_SLOW_DIST)
                     ? SLOW_SPEED
                     : BASE_SPEED;
@@ -107,8 +108,7 @@ void WallFollowFSM::handleFollow() {
 }
 
 // -------------------------------------------------------
-// TURN_RIGHT — encoder-counted 90° pivot right
-// Left wheel forward, right wheel backward
+// TURN_RIGHT — unchanged
 // -------------------------------------------------------
 void WallFollowFSM::handleTurnRight() {
     if (millis() - _stateEntryMs < STATE_ENTRY_DELAY_MS) return;
@@ -141,7 +141,7 @@ void WallFollowFSM::handleTurnRight() {
 }
 
 // -------------------------------------------------------
-// WALL_LOST — dispatches to active sub-phase handler
+// WALL_LOST — unchanged
 // -------------------------------------------------------
 void WallFollowFSM::handleWallLost() {
     switch (_wallLostPhase) {
@@ -151,7 +151,7 @@ void WallFollowFSM::handleWallLost() {
     }
 }
 
-// ── Phase 1: reverse until wall reacquired or max distance hit ──
+// ── Phase 1: reverse — unchanged ──
 void WallFollowFSM::handleWLReverse() {
     if (millis() - _stateEntryMs < STATE_ENTRY_DELAY_MS) return;
 
@@ -186,7 +186,7 @@ void WallFollowFSM::handleWLReverse() {
     _motorRight.setPWM(-pwmVal);
 }
 
-// ── Phase 2: creep forward a fixed distance before arcing ──
+// ── Phase 2: creep — unchanged ──
 void WallFollowFSM::handleWLCreep() {
     if (millis() - _stateEntryMs < STATE_ENTRY_DELAY_MS) return;
 
@@ -214,8 +214,10 @@ void WallFollowFSM::handleWLCreep() {
     _motorRight.setPWM(pwmVal);
 }
 
-// ── Phase 3: arc left until wall reacquired ──
+// ── Phase 3: arc — only change is the _suspended guard at the top ──
 void WallFollowFSM::handleWLArc() {
+    if (_suspended) return;  // NEW: inert while ball collection is active
+
     if (millis() - _stateEntryMs < STATE_ENTRY_DELAY_MS) return;
 
 #if DEBUG_SERIAL
@@ -243,7 +245,6 @@ void WallFollowFSM::handleWLArc() {
         return;
     }
 
-    // Right (outer) wheel faster, left (inner) slower → arc left
     int outerPWM = map(ARC_OUTER_SPEED, 0, 20, 0, 255);
     int innerPWM = map(ARC_INNER_SPEED, 0, 20, 0, 255);
     _motorRight.setPWM(outerPWM);
@@ -251,7 +252,54 @@ void WallFollowFSM::handleWLArc() {
 }
 
 // -------------------------------------------------------
-// enterState — resets entry timestamp for new top-level state
+// suspend() — NEW
+// -------------------------------------------------------
+void WallFollowFSM::suspend() {
+    if (_state != NavState::WALL_LOST) return;
+    if (_wallLostPhase != WallLostPhase::WL_ARC) return;
+    if (_suspended) return;
+
+    _arcElapsedAtSuspend = millis() - _arcStartMs;
+    _suspended = true;
+
+    _motorLeft.stop();
+    _motorRight.stop();
+
+#if DEBUG_SERIAL
+    Serial.print("WallFollowFSM | suspended, arc_elapsed_ms=");
+    Serial.println(_arcElapsedAtSuspend);
+#endif
+}
+
+// -------------------------------------------------------
+// resume() — NEW
+// -------------------------------------------------------
+void WallFollowFSM::resume() {
+    if (!_suspended) return;
+
+    // Rebuild _arcStartMs so the remaining timeout budget is preserved.
+    // After this: (millis() - _arcStartMs) == _arcElapsedAtSuspend,
+    // meaning (ARC_TIMEOUT_MS - _arcElapsedAtSuspend) ms remain.
+    _arcStartMs = millis() - _arcElapsedAtSuspend;
+
+    // Skip the re-entry delay — robot has already stopped and settled
+    _stateEntryMs = millis() - STATE_ENTRY_DELAY_MS - 1;
+
+    _suspended = false;
+
+    // State and phase are already WALL_LOST / WL_ARC.
+    // handleWLArc() runs on the very next update() call.
+
+#if DEBUG_SERIAL
+    Serial.print("WallFollowFSM | resumed, arc_elapsed_ms=");
+    Serial.print(_arcElapsedAtSuspend);
+    Serial.print(" | remaining_ms=");
+    Serial.println(ARC_TIMEOUT_MS - _arcElapsedAtSuspend);
+#endif
+}
+
+// -------------------------------------------------------
+// enterState — unchanged
 // -------------------------------------------------------
 void WallFollowFSM::enterState(NavState newState) {
     _state        = newState;
@@ -263,7 +311,7 @@ void WallFollowFSM::enterState(NavState newState) {
 }
 
 // -------------------------------------------------------
-// enterWallLostPhase — resets entry timestamp for new sub-phase
+// enterWallLostPhase — unchanged
 // -------------------------------------------------------
 void WallFollowFSM::enterWallLostPhase(WallLostPhase phase) {
     _wallLostPhase = phase;

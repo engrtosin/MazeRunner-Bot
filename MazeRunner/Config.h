@@ -122,6 +122,7 @@ inline bool breakBeamTriggered() {
 // x/y are 0-254 (never 0xFF so they can't mimic the header)
 #define BALL_TIMEOUT_MS         300     // ms of silence → ball lost
 #define BALL_ENTRY_DELAY_MS     300     // settle delay for ball sub-states
+#define BALL_CLOSE_Y            200     // Y pixel threshold for "ball is close enough to collect during arc".
  
 // Tracking
 #define X_CENTER                127     // pixel x midpoint

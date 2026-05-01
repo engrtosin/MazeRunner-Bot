@@ -8,8 +8,9 @@
 // -------------------------------------------------------
 RobotFSM::RobotFSM(MotorController &motorLeft,  MotorController &motorRight,
                    IRSensor        &irFront,    IRSensor        &irLeft,
-                   RPiComms       &rpiComms)
-    : _motorLeft(motorLeft), _motorRight(motorRight),
+                   RPiComms        &rpiComms)
+    : _motorLeft(motorLeft),
+      _motorRight(motorRight),
       _rpiComms(rpiComms),
       _state(TopState::WALL_FOLLOW),
       _wallFollow(motorLeft, motorRight, irFront, irLeft),
@@ -17,50 +18,71 @@ RobotFSM::RobotFSM(MotorController &motorLeft,  MotorController &motorRight,
 {}
 
 // -------------------------------------------------------
-// Main update
+// update()
 // -------------------------------------------------------
 void RobotFSM::update() {
     switch (_state) {
 
-        case TopState::WALL_FOLLOW:
-            // Ball override: only trigger when wall-follow is in
-            // steady FOLLOW state — not mid-turn or mid-recovery.
-            // TODO (future): expand this condition to also allow
-            // override during WALL_LOST by calling
-            // _wallFollow.suspend() before enterState(BALL_OVERRIDE)
-            // and _wallFollow.resume() on return.
-            if (_rpiComms.isBallVisible() &&
-                _wallFollow.getState() == NavState::FOLLOW) {
-                _motorLeft.stop();
-                _motorRight.stop();
-                enterState(TopState::BALL_OVERRIDE);
-#if DEBUG_SERIAL
-                Serial.println("Ball detected -> BALL_OVERRIDE");
-#endif
-                return;
+        case TopState::WALL_FOLLOW: {
+
+            // ── Ball during WL_ARC (new) ──────────────────────────
+            // Check before _wallFollow.update() so we intercept the
+            // arc on this tick rather than one tick later.
+            if (_wallFollow.getState()         == NavState::WALL_LOST  &&
+                _wallFollow.getWallLostPhase() == WallLostPhase::WL_ARC &&
+                _rpiComms.isBallVisible()                               &&
+                _rpiComms.getBallY()           >= BALL_CLOSE_Y) {
+                enterState(TopState::BALL_OVERRIDE, true);  // true = from arc
+                break;
             }
+
+            // ── Ball during normal FOLLOW (existing) ──────────────
+            if (_wallFollow.getState() == NavState::FOLLOW &&
+                _rpiComms.isBallVisible()) {
+                enterState(TopState::BALL_OVERRIDE, false);
+                break;
+            }
+
             _wallFollow.update();
             break;
+        }
 
-        case TopState::BALL_OVERRIDE:
+        case TopState::BALL_OVERRIDE: {
             _ball.update();
+
             if (_ball.isDone()) {
-                enterState(TopState::WALL_FOLLOW);
+                // If we suspended an arc, resume it; otherwise just go back
+                if (_wallFollow.isSuspended()) {
+                    _wallFollow.resume();
 #if DEBUG_SERIAL
-                Serial.println("Ball done -> WALL_FOLLOW");
+                    Serial.println("RobotFSM | ball done -> arc resumed");
 #endif
+                } else {
+#if DEBUG_SERIAL
+                    Serial.println("RobotFSM | ball done -> WALL_FOLLOW");
+#endif
+                }
+                _state = TopState::WALL_FOLLOW;
             }
             break;
+        }
     }
 }
 
 // -------------------------------------------------------
 // enterState
 // -------------------------------------------------------
-void RobotFSM::enterState(TopState newState) {
+void RobotFSM::enterState(TopState newState, bool fromArc) {
     _state = newState;
 
     if (_state == TopState::BALL_OVERRIDE) {
+        if (fromArc) {
+            _wallFollow.suspend();   // freeze arc, stop motors
+        }
         _ball.start();
+#if DEBUG_SERIAL
+        Serial.print("RobotFSM | -> BALL_OVERRIDE fromArc=");
+        Serial.println(fromArc ? "true" : "false");
+#endif
     }
 }

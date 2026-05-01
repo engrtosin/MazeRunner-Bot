@@ -53,7 +53,7 @@ void IRSensor::update() {
 // -------------------------------------------------------
 
 float IRSensor::readADC() {
-    analogRead(_pin);           // discard — lets mux and capacitor settle
+    // analogRead(_pin);           // discard — lets mux and capacitor settle
     return (float)analogRead(_pin);  // accurate read
 }
 

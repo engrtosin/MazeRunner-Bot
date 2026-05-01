@@ -96,6 +96,7 @@ inline bool breakBeamTriggered() {
 
 
 // ================= IR FILTER =================
+#define IR_VALUE_CAP    1000.0f
 // 4th-order Butterworth (two biquad stages) + moving average
 #define MA_WINDOW       6               // Moving average window size
 // Biquad stage 1 coefficients

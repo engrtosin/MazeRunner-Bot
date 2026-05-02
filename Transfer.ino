@@ -1,5 +1,5 @@
 // =============================================================
-//  Wall-Following + Ball Collector — Arduino
+//  Wall-Following + Ball Collector -- Arduino
 //
 //  Default behaviour : wall following (left wall, IR sensors).
 //  Override          : when RPi sends 2-byte ball packets, the
@@ -7,17 +7,27 @@
 //                      full TRACK -> COLLECT -> COLLECTED cycle,
 //                      then resumes wall-following automatically.
 //
-//  Wall-proximity reverse: if the robot crossed the FRONT_STOP_DIST
-//  threshold while tracking or collecting a ball (detected by the
-//  front sensor ever reading above FRONT_IR_AMBIGUOUS_CM during the
-//  approach, indicating it entered the close-range curl-back zone),
-//  the post-collection BP_COLLECTED phase reverses the robot instead
-//  of immediately returning to wall-follow.  Reverse continues until
-//  the front IR reads reliably below FRONT_STOP_DIST for
-//  FRONT_CLEAR_CONFIRM_COUNT consecutive samples, meaning the robot
-//  has backed out of the ambiguous zone and the wall is genuinely
-//  at ~FRONT_STOP_DIST again.  At that point normal wall-follow
-//  resumes.
+//  Post-collection reverse:
+//    After collecting a ball, if the front IR reads within the
+//    danger band [FRONT_REV_BAND_LO, FRONT_REV_BAND_HI] the robot
+//    reverses.  Two cases are handled:
+//
+//    Case A -- reading rises during reverse (robot was in normal
+//    range but just slightly too close):
+//      Stop once the reading has increased FRONT_REV_RISE_CLEAR cm
+//      above the value recorded at the start of reverse.
+//
+//    Case B -- reading falls during reverse (robot is in the IR
+//    curl-back zone; the sensor wraps and reads high even though
+//    the wall is very close):
+//      The reading will dip through a minimum then start climbing.
+//      Keep reversing until the reading climbs back up to
+//      FRONT_STOP_DIST, at which point the sensor is back in the
+//      reliable region and the robot is at a safe distance.
+//
+//  The two cases are distinguished automatically: if the first
+//  directional movement of the reading (after a small settling
+//  window) is upward it is Case A; if it is downward it is Case B.
 //
 //  RPi -> Arduino serial protocol (115200 baud):
 //    3 bytes per detected ball frame:
@@ -25,9 +35,6 @@
 //      [1] x_byte : 0-255 mapped from pixel x (clamped to 0-254)
 //      [2] y_byte : 0-255 mapped from pixel y (clamped to 0-254)
 //    Silence for > BALL_TIMEOUT_MS -> ball lost.
-//    Arduino re-syncs by scanning for 0xFF, so stale debug bytes
-//    cannot cause misalignment. x/y bytes are clamped to 0-254
-//    so they never accidentally look like the header.
 // =============================================================
 
 // ================= PIN DEFINITIONS =================
@@ -42,8 +49,8 @@
 #define ENC_L        2
 #define ENC_R        3
 
-#define ROLLER_PIN   5    // HIGH = rollers on
-#define BREAK_BEAM   A4   // LOW  = ball inside
+#define ROLLER_PIN   5
+#define BREAK_BEAM   A4
 
 #define FRONT_IR_PIN A2
 #define LEFT_IR_PIN  A3
@@ -57,9 +64,7 @@ struct Motor {
   float targetRPM;
   float currentRPM;
   float pwm;
-  float Kp;
-  float Ki;
-  float integral;
+  float Kp, Ki, integral;
   bool invertDir;
 };
 
@@ -71,27 +76,22 @@ struct ButterworthState { BiquadState s1, s2; };
 #define MA_WINDOW 6
 struct MovingAverage {
   float buffer[MA_WINDOW] = {0};
-  float sum   = 0;
+  float sum = 0;
   int   index = 0;
 };
 
 // ================= GLOBALS =================
-Motor leftMotor;
-Motor rightMotor;
-
-ButterworthState frontFilter;
-ButterworthState leftFilter;
-
-MovingAverage frontMA;
-MovingAverage leftMA;
+Motor leftMotor, rightMotor;
+ButterworthState frontFilter, leftFilter;
+MovingAverage frontMA, leftMA;
 
 unsigned long lastControlTime = 0;
 unsigned long prevIRTime      = 0;
 
 // ================= STATE ENTRY DELAY =================
 unsigned long stateEntryMs = 0;
-#define STATE_ENTRY_DELAY_MS  400   // wall-follow states
-#define BALL_ENTRY_DELAY_MS   300   // ball sub-states
+#define STATE_ENTRY_DELAY_MS  400
+#define BALL_ENTRY_DELAY_MS   300
 
 // ================= FILTER COEFFICIENTS =================
 const BiquadCoeff stage1Coeff = {
@@ -108,23 +108,23 @@ const float A_front = 1.23072369e+04f, B_front = 1.12642133e+01f, C_front =  1.7
 const float A_left  = 7.68904930e+03f, B_left  = 1.00000065e-03f, C_left  = -2.64920279e+00f;
 
 // ================= TIMING =================
-const int          intervalMs      = 100;
-const unsigned long IR_SAMPLE_TIME = 10000;  // microseconds
+const int           intervalMs     = 100;
+const unsigned long IR_SAMPLE_TIME = 10000;
 
 // ================= WALL-FOLLOW THRESHOLDS =================
-#define TARGET_LEFT_DIST     20.0f
-#define FRONT_STOP_DIST      30.0f
-#define FRONT_SLOW_DIST      30.0f
-#define WALL_LOST_DIST       50.0f
-#define WALL_RECOVERY_DIST   30.0f
+#define TARGET_LEFT_DIST    20.0f
+#define FRONT_STOP_DIST     30.0f
+#define FRONT_SLOW_DIST     30.0f
+#define WALL_LOST_DIST      50.0f
+#define WALL_RECOVERY_DIST  30.0f
 
 // ================= WALL-FOLLOW SPEEDS =================
-#define BASE_SPEED           20
-#define SLOW_SPEED_WF         7
-#define WALL_LOST_OL_SPEED    3
-#define TURN_SPEED            7
-#define ARC_OUTER_SPEED       5
-#define ARC_INNER_SPEED       2
+#define BASE_SPEED          20
+#define SLOW_SPEED_WF        7
+#define WALL_LOST_OL_SPEED   3
+#define TURN_SPEED           7
+#define ARC_OUTER_SPEED      5
+#define ARC_INNER_SPEED      2
 
 // ================= PIVOT / RECOVERY GEOMETRY =================
 #define TURN_COUNTS_L        171
@@ -138,56 +138,40 @@ const unsigned long IR_SAMPLE_TIME = 10000;  // microseconds
 #define ARC_MAX_COUNTS       327
 
 // ================= BALL-TRACK SPEEDS =================
-#define TRACK_SPEED          7    // RPM forward during tracking
-#define CREEP_SPEED_BALL     3    // RPM forward during collection
-#define MAX_CORRECTION       3    // RPM differential cap
+#define TRACK_SPEED       7
+#define CREEP_SPEED_BALL  3
+#define MAX_CORRECTION    3
 
 // ================= BALL HEADING CORRECTION =================
-#define X_CENTER   127
-#define DEAD_BAND    8
+#define X_CENTER  127
+#define DEAD_BAND   8
 float Kp_heading = 0.030f;
 
 // ================= BALL TIMEOUT =================
 #define BALL_TIMEOUT_MS  300
 unsigned long lastPacketMs = 0;
 uint8_t pkt[2] = {0, 0};
-
 bool ballVisible() { return (millis() - lastPacketMs < BALL_TIMEOUT_MS); }
 
-// ================= FRONT IR PROXIMITY DETECTION =================
+// ================= POST-COLLECTION REVERSE THRESHOLDS =================
 //
-// The Sharp IR sensors curl back at very close range: the output
-// voltage (and therefore the computed distance) starts rising again
-// once the wall is closer than ~10-15 cm.  This means a reading of,
-// say, 21 cm could mean "wall is 21 cm away" (reliable) OR "wall is
-// ~5 cm away and the sensor has wrapped" (unreliable).
+// After collecting, if frontDistanceCM is inside [FRONT_REV_BAND_LO,
+// FRONT_REV_BAND_HI] the robot needs to reverse before wall-following.
 //
-// Strategy: during ball collection we watch for the sensor reading
-// rising above FRONT_IR_AMBIGUOUS_CM.  That rising trend is only
-// possible if the robot has driven close enough to enter the wrap
-// zone — a genuine 21 cm wall would have triggered the normal pivot
-// before ball collection even started.  So any value above this
-// threshold during collection means "we are very close to the wall".
+// FRONT_REV_BAND_LO : lower bound of the danger band.  Below this the
+//   reading is reliable and the robot is far enough to turn normally.
+// FRONT_REV_BAND_HI : upper bound.  Above this the wall is not a concern
+//   (open space ahead).
+// FRONT_REV_RISE_CLEAR : Case A exit -- stop once the reading has risen
+//   this many cm above the value seen at the start of reverse.
+//   (robot was close but not in curl-back; a small retreat is enough)
+// FRONT_STOP_DIST is reused as the Case B exit target -- once the sensor
+//   climbs back to this value after the curl-back dip the robot is at
+//   the normal pivot distance and wall-follow can resume safely.
 //
-// On reverse, we wait for the reading to fall back BELOW
-// FRONT_STOP_DIST and stay there for FRONT_CLEAR_CONFIRM_COUNT
-// consecutive IR samples (~100 ms each by default).  That confirms
-// the sensor has exited the ambiguous zone and the robot is at a
-// safe distance again.
-//
-// FRONT_IR_AMBIGUOUS_CM: readings above this during approach signal
-//   that the sensor has entered the curl-back zone.  Set just above
-//   the typical "true" FRONT_STOP_DIST reading so normal stopping
-//   distances don't accidentally arm the flag.
-#define FRONT_IR_AMBIGUOUS_CM     23.0f  // cm — arm threshold during approach
-#define FRONT_CLEAR_CONFIRM_COUNT  4     // consecutive samples needed to confirm clear
-
-// Flag set when the front sensor entered the ambiguous zone during
-// ball approach / collection.  Cleared when the robot backs clear.
-bool  frontProximityArmed = false;
-// Counter incremented each IR cycle that frontDistanceCM < FRONT_STOP_DIST
-// while reversing; reset whenever the condition is not met.
-int   frontClearCount     = 0;
+#define FRONT_REV_BAND_LO    20.0f   // cm -- start reversing if above this
+#define FRONT_REV_BAND_HI    33.0f   // cm -- start reversing if below this
+#define FRONT_REV_RISE_CLEAR  5.0f   // cm -- Case A: rise needed to stop
 
 // ================= IR READINGS =================
 float frontDistanceCM = 0;
@@ -204,16 +188,13 @@ enum RobotState {
 };
 RobotState robotState = STATE_WALL_FOLLOW;
 
-// -- Pivot turn --
 long turnStartCountL = 0, turnStartCountR = 0;
 
-// -- Wall-lost recovery --
 enum WallLostPhase { WL_REVERSE, WL_CREEP, WL_ARC, WL_REALIGN };
 WallLostPhase wallLostPhase  = WL_REVERSE;
 long          wallLostStartL = 0, wallLostStartR = 0;
 unsigned long arcStartMs     = 0;
 
-// -- Ball sub-state --
 enum BallPhase { BP_TRACK, BP_COLLECT, BP_COLLECTED };
 BallPhase     ballPhase   = BP_TRACK;
 unsigned long ballPhaseMs = 0;
@@ -237,18 +218,18 @@ void initMotor(Motor &m, int dirPin, int pwmPin, int encPin,
 
 void setMotorPWM(Motor &m, float pwm) {
   pwm = constrain(pwm, -255, 255);
-  bool goForward = (pwm >= 0);
-  if (m.invertDir) goForward = !goForward;
-  digitalWrite(m.dirPin, goForward ? HIGH : LOW);
+  bool fwd = (pwm >= 0);
+  if (m.invertDir) fwd = !fwd;
+  digitalWrite(m.dirPin, fwd ? HIGH : LOW);
   analogWrite(m.pwmPin, (int)abs(pwm));
   m.pwm = pwm;
 }
 
 void hardStop() {
-  leftMotor.targetRPM  = 0; rightMotor.targetRPM = 0;
-  leftMotor.integral   = 0; rightMotor.integral  = 0;
-  leftMotor.pwm        = 0; rightMotor.pwm       = 0;
-  setMotorPWM(leftMotor, 0);
+  leftMotor.targetRPM = rightMotor.targetRPM = 0;
+  leftMotor.integral  = rightMotor.integral  = 0;
+  leftMotor.pwm       = rightMotor.pwm       = 0;
+  setMotorPWM(leftMotor,  0);
   setMotorPWM(rightMotor, 0);
 }
 
@@ -268,7 +249,8 @@ float processBiquad(const BiquadCoeff &c, BiquadState &s, float x) {
   return y;
 }
 float processButterworth(ButterworthState &f, float x) {
-  return processBiquad(stage2Coeff, f.s2, processBiquad(stage1Coeff, f.s1, x));
+  return processBiquad(stage2Coeff, f.s2,
+         processBiquad(stage1Coeff, f.s1, x));
 }
 
 // ================= MOVING AVERAGE =================
@@ -281,8 +263,12 @@ float applyMA(MovingAverage &ma, float x) {
 }
 
 // ================= IR SENSOR =================
-float computeFront(float adc) { return max(A_front / (adc + B_front) + C_front, 0.0f); }
-float computeLeft(float adc)  { return constrain(A_left / (adc + B_left) + C_left, 0.0f, 500.0f); }
+float computeFront(float adc) {
+  return max(A_front / (adc + B_front) + C_front, 0.0f);
+}
+float computeLeft(float adc) {
+  return constrain(A_left / (adc + B_left) + C_left, 0.0f, 500.0f);
+}
 
 void updateIR() {
   unsigned long now = micros();
@@ -292,28 +278,20 @@ void updateIR() {
     frontDistanceCM = applyMA(frontMA, computeFront(fF));
     leftDistanceCM  = applyMA(leftMA,  computeLeft(fL));
     prevIRTime += IR_SAMPLE_TIME;
-
-    // -- Proximity arm: if we are in ball override and the front sensor
-    //    rises above the ambiguous threshold, record that the robot has
-    //    entered the curl-back zone. --
-    if (robotState == STATE_BALL_OVERRIDE &&
-        (ballPhase == BP_TRACK || ballPhase == BP_COLLECT)) {
-      if (frontDistanceCM > FRONT_IR_AMBIGUOUS_CM) {
-        frontProximityArmed = true;
-      }
-    }
   }
 }
 
 // ================= RPM + PID =================
 void updateRPM(Motor &m, float dt) {
-  long delta   = m.count - m.lastCount;
-  m.lastCount  = m.count;
+  long delta  = m.count - m.lastCount;
+  m.lastCount = m.count;
   m.currentRPM = ((float)delta / m.cpr / dt) * 60.0f;
 }
 
 void updatePID(Motor &m, float dt) {
-  if (m.targetRPM == 0) { m.integral = 0; m.pwm = 0; setMotorPWM(m, 0); return; }
+  if (m.targetRPM == 0) {
+    m.integral = 0; m.pwm = 0; setMotorPWM(m, 0); return;
+  }
   float error  = m.targetRPM - m.currentRPM;
   bool satHigh = (m.pwm >= 255 && error > 0);
   bool satLow  = (m.pwm <=   0 && error < 0);
@@ -337,7 +315,7 @@ void updateControl() {
   }
 }
 
-// ================= SERIAL READ (NON-BLOCKING) =================
+// ================= SERIAL READ =================
 void readSerial() {
   while (Serial.available() >= 3) {
     if (Serial.peek() != 0xFF) { Serial.read(); continue; }
@@ -349,13 +327,12 @@ void readSerial() {
 }
 
 // ================= BREAK BEAM =================
-bool breakBeamTriggered() { return (digitalRead(BREAK_BEAM) == LOW); }
+bool breakBeamTriggered() { return digitalRead(BREAK_BEAM) == LOW; }
 
 // ====================================================================
 //  STATE HANDLERS
 // ====================================================================
 
-// -- Wall Follow -----------------------------------------------------
 void doWallFollow() {
   if (millis() - stateEntryMs < STATE_ENTRY_DELAY_MS) return;
 
@@ -382,12 +359,10 @@ void doWallFollow() {
                      ? SLOW_SPEED_WF : BASE_SPEED;
   float error      = leftDistanceCM - TARGET_LEFT_DIST;
   float correction = constrain(1.0f * error, -5.0f, 5.0f);
-
   leftMotor.targetRPM  = constrain(baseRPM - correction, 0, 20);
   rightMotor.targetRPM = constrain(baseRPM + correction, 0, 20);
 }
 
-// -- Pivot Turn ------------------------------------------------------
 void doTurning() {
   if (millis() - stateEntryMs < STATE_ENTRY_DELAY_MS) return;
 
@@ -406,7 +381,6 @@ void doTurning() {
   setMotorPWM(rightMotor, (travelR < TURN_COUNTS_R) ? -pwmVal : 0);
 }
 
-// -- Wall Lost Recovery ----------------------------------------------
 void doWallLost() {
   if (millis() - stateEntryMs < STATE_ENTRY_DELAY_MS) return;
 
@@ -480,12 +454,11 @@ void doWallLost() {
   }
 }
 
-// -- Ball Override (TRACK -> COLLECT -> COLLECTED) -------------------
+// ── Ball Override ───────────────────────────────────────────────────
 void doBallOverride() {
 
   switch (ballPhase) {
 
-    // Track: differential steer toward ball
     case BP_TRACK: {
       if (millis() - ballPhaseMs < BALL_ENTRY_DELAY_MS) return;
 
@@ -499,31 +472,21 @@ void doBallOverride() {
 
       float error      = (float)pkt[0] - (float)X_CENTER;
       float correction = 0;
-      if (abs(error) > DEAD_BAND) {
+      if (abs(error) > DEAD_BAND)
         correction = constrain(Kp_heading * error,
-                               -(float)MAX_CORRECTION,
-                                (float)MAX_CORRECTION);
-      }
-      leftMotor.targetRPM  = constrain((float)TRACK_SPEED + correction,
-                                       0, (float)(TRACK_SPEED + MAX_CORRECTION));
-      rightMotor.targetRPM = constrain((float)TRACK_SPEED - correction,
-                                       0, (float)(TRACK_SPEED + MAX_CORRECTION));
+                               -(float)MAX_CORRECTION, (float)MAX_CORRECTION);
+
+      leftMotor.targetRPM  = constrain((float)TRACK_SPEED + correction, 0,
+                                       (float)(TRACK_SPEED + MAX_CORRECTION));
+      rightMotor.targetRPM = constrain((float)TRACK_SPEED - correction, 0,
+                                       (float)(TRACK_SPEED + MAX_CORRECTION));
       break;
     }
 
-    // Collect: rollers on, creep until break beam or timeout
     case BP_COLLECT: {
       rollersOn();
 
-      if (breakBeamTriggered()) {
-        hardStop();
-        rollersOff();
-        ballPhase   = BP_COLLECTED;
-        ballPhaseMs = millis();
-        return;
-      }
-
-      if (millis() - ballPhaseMs > 3000) {
+      if (breakBeamTriggered() || millis() - ballPhaseMs > 3000) {
         hardStop();
         rollersOff();
         ballPhase   = BP_COLLECTED;
@@ -536,65 +499,94 @@ void doBallOverride() {
       break;
     }
 
-    // Collected: 2 s pause, then either reverse-to-clear or return to wall-follow.
+    // ── Collected ───────────────────────────────────────────────────
     //
-    // Reverse logic runs every loop tick (not gated on the pause timer) so
-    // the IR check and motor commands execute at the full loop rate.
-    // A one-shot flag (reversing) activates after the pause expires and stays
-    // set until the front sensor is confirmed clear.
+    // After the 2 s pause, check whether the front IR is in the
+    // danger band.  If it is, reverse.  While reversing:
+    //
+    //   - Track the reading at reverse start (revStartReading) and
+    //     the running minimum seen so far (revMinReading).
+    //
+    //   - If the reading rises from the start without ever going
+    //     below revStartReading - 1 cm (no dip), it is Case A:
+    //     stop once the reading has risen FRONT_REV_RISE_CLEAR above
+    //     revStartReading.
+    //
+    //   - If the reading drops below revStartReading - 1 cm at any
+    //     point, the curl-back zone is confirmed (Case B): keep
+    //     going until the reading climbs back up to FRONT_STOP_DIST.
+    //
+    //  The 1 cm tolerance absorbs sensor noise when deciding whether
+    //  a dip has occurred.
+    //
     case BP_COLLECTED: {
       rollersOff();
 
-      // ---- Pause phase: hold still for 2 s ----
+      // 2 s pause
       if (millis() - ballPhaseMs <= 2000) {
         hardStop();
         break;
       }
 
-      // ---- One-time setup on first tick after pause ----
-      // Flush stale serial packets so we don't immediately re-trigger ball
-      // detection once we return to wall-follow.
-      static bool postPauseInit = false;
-      if (!postPauseInit) {
+      // Persistent state for the reverse phase, initialised once per
+      // collection cycle using a static + a fresh-cycle flag.
+      static bool  revInitDone    = false;
+      static float revStartReading = 0.0f;
+      static float revMinReading   = 0.0f;
+      static bool  revNeedReverse  = false;
+      static bool  revCurlBack     = false;   // Case B confirmed
+
+      // One-time init on first tick after the pause
+      if (!revInitDone) {
         while (Serial.available()) Serial.read();
-        lastPacketMs    = 0;
-        frontClearCount = 0;
-        postPauseInit   = true;
+        lastPacketMs = 0;
+
+        float f = frontDistanceCM;
+        revNeedReverse = (f > FRONT_REV_BAND_LO && f < FRONT_REV_BAND_HI);
+        revStartReading = f;
+        revMinReading   = f;
+        revCurlBack     = false;
+        revInitDone     = true;
       }
 
-      // ---- No proximity issue: return to wall-follow immediately ----
-      if (!frontProximityArmed) {
+      // No reverse needed: return to wall-follow
+      if (!revNeedReverse) {
         hardStop();
-        postPauseInit       = false;
-        frontProximityArmed = false;
-        stateEntryMs        = millis();
-        robotState          = STATE_WALL_FOLLOW;
+        revInitDone = false;
+        stateEntryMs = millis();
+        robotState   = STATE_WALL_FOLLOW;
         break;
       }
 
-      // ---- Proximity armed: reverse until front IR is reliably clear ----
-      // Drive both motors backward at the same open-loop PWM used elsewhere.
+      // --- Reversing ---
       int pwmVal = map(WALL_LOST_OL_SPEED, 0, 20, 0, 255);
       setMotorPWM(leftMotor,  -pwmVal);
       setMotorPWM(rightMotor, -pwmVal);
 
-      // Increment confirmation counter only while the reading is below
-      // FRONT_STOP_DIST (sensor has exited the curl-back zone).
-      // Reset it any time the reading is ambiguous (high or zero) so we
-      // require a clean consecutive run.
-      if (frontDistanceCM > 0.0f && frontDistanceCM < FRONT_STOP_DIST) {
-        frontClearCount++;
+      float f = frontDistanceCM;
+
+      // Update running minimum
+      if (f > 0.0f && f < revMinReading) revMinReading = f;
+
+      // Detect curl-back: reading dropped more than 1 cm below start
+      if (f > 0.0f && f < revStartReading - 1.0f) revCurlBack = true;
+
+      bool done = false;
+      if (!revCurlBack) {
+        // Case A: reading going up from the start -- stop once it has
+        // risen FRONT_REV_RISE_CLEAR above the starting value.
+        done = (f > revStartReading + FRONT_REV_RISE_CLEAR);
       } else {
-        frontClearCount = 0;
+        // Case B: curl-back confirmed -- stop once the reading has
+        // climbed back up to FRONT_STOP_DIST after the dip.
+        done = (f >= FRONT_STOP_DIST);
       }
 
-      if (frontClearCount >= FRONT_CLEAR_CONFIRM_COUNT) {
+      if (done) {
         hardStop();
-        postPauseInit       = false;
-        frontProximityArmed = false;
-        frontClearCount     = 0;
-        stateEntryMs        = millis();
-        robotState          = STATE_WALL_FOLLOW;
+        revInitDone = false;
+        stateEntryMs = millis();
+        robotState   = STATE_WALL_FOLLOW;
       }
       break;
     }
@@ -630,15 +622,16 @@ void setup() {
   stateEntryMs    = millis();
 
   Serial.println("=== Wall-Follow + Ball Collector Started ===");
-  Serial.print("Target left dist    : "); Serial.print(TARGET_LEFT_DIST);              Serial.println(" cm");
-  Serial.print("Wall lost dist      : "); Serial.print(WALL_LOST_DIST);                Serial.println(" cm");
-  Serial.print("Base speed          : "); Serial.print(BASE_SPEED);                    Serial.println(" RPM");
-  Serial.print("Track speed         : "); Serial.print(TRACK_SPEED);                   Serial.println(" RPM");
-  Serial.print("Creep speed         : "); Serial.print(CREEP_SPEED_BALL);              Serial.println(" RPM");
-  Serial.print("Ball timeout        : "); Serial.print(BALL_TIMEOUT_MS);               Serial.println(" ms");
-  Serial.print("Entry delay (WF)    : "); Serial.print(STATE_ENTRY_DELAY_MS);          Serial.println(" ms");
-  Serial.print("Front ambiguous thr : "); Serial.print(FRONT_IR_AMBIGUOUS_CM);         Serial.println(" cm");
-  Serial.print("Front clear confirm : "); Serial.print(FRONT_CLEAR_CONFIRM_COUNT);     Serial.println(" samples");
+  Serial.print("Target left dist   : "); Serial.print(TARGET_LEFT_DIST);        Serial.println(" cm");
+  Serial.print("Wall lost dist     : "); Serial.print(WALL_LOST_DIST);          Serial.println(" cm");
+  Serial.print("Base speed         : "); Serial.print(BASE_SPEED);              Serial.println(" RPM");
+  Serial.print("Track speed        : "); Serial.print(TRACK_SPEED);             Serial.println(" RPM");
+  Serial.print("Creep speed        : "); Serial.print(CREEP_SPEED_BALL);        Serial.println(" RPM");
+  Serial.print("Ball timeout       : "); Serial.print(BALL_TIMEOUT_MS);         Serial.println(" ms");
+  Serial.print("Entry delay (WF)   : "); Serial.print(STATE_ENTRY_DELAY_MS);    Serial.println(" ms");
+  Serial.print("Rev band lo        : "); Serial.print(FRONT_REV_BAND_LO);       Serial.println(" cm");
+  Serial.print("Rev band hi        : "); Serial.print(FRONT_REV_BAND_HI);       Serial.println(" cm");
+  Serial.print("Rev rise clear     : "); Serial.print(FRONT_REV_RISE_CLEAR);    Serial.println(" cm");
   Serial.println("============================================");
 }
 
@@ -650,11 +643,8 @@ void loop() {
   updateIR();
   updateControl();
 
-  // Global override: ball detected while wall-following
   if (robotState == STATE_WALL_FOLLOW && ballVisible()) {
     hardStop();
-    frontProximityArmed = false;   // fresh collection cycle
-    frontClearCount     = 0;
     ballPhase   = BP_TRACK;
     ballPhaseMs = millis();
     robotState  = STATE_BALL_OVERRIDE;

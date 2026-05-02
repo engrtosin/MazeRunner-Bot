@@ -4,38 +4,27 @@
 //  Default behaviour : wall following (left wall, IR sensors).
 //  Override          : when RPi sends 2-byte ball packets, the
 //                      robot suspends wall-following and runs the
-//                      full TRACK → COLLECT → COLLECTED cycle,
+//                      full TRACK -> COLLECT -> COLLECTED cycle,
 //                      then resumes wall-following automatically.
 //
-//  Arc ball intercept: while executing WL_ARC, if a ball is seen
-//                      with X >= BALL_ARC_X_THRESHOLD and
-//                      Y >= BALL_ARC_Y_THRESHOLD the robot interrupts
-//                      the arc, runs the full TRACK → COLLECT →
-//                      COLLECTED → REVERSE cycle, then resumes the
-//                      arc.  The arc timeout clock is frozen during
-//                      the interruption and resumes afterwards.
+//  Wall-proximity reverse: if the robot crossed the FRONT_STOP_DIST
+//  threshold while tracking or collecting a ball (detected by the
+//  front sensor ever reading above FRONT_IR_AMBIGUOUS_CM during the
+//  approach, indicating it entered the close-range curl-back zone),
+//  the post-collection BP_COLLECTED phase reverses the robot instead
+//  of immediately returning to wall-follow.  Reverse continues until
+//  the front IR reads reliably below FRONT_STOP_DIST for
+//  FRONT_CLEAR_CONFIRM_COUNT consecutive samples, meaning the robot
+//  has backed out of the ambiguous zone and the wall is genuinely
+//  at ~FRONT_STOP_DIST again.  At that point normal wall-follow
+//  resumes.
 //
-//  Reverse distance  : after collecting, the robot reverses using
-//                      the same open-loop PWM as WALL_LOST_OL_SPEED.
-//                      The reverse duration is calculated from the
-//                      actual time spent in each forward phase:
-//
-//        t_rev = 0.95 * (t_track * TRACK_SPEED
-//                       + t_collect * CREEP_SPEED_BALL)
-//                      / WALL_LOST_OL_SPEED
-//
-//                      This converts the accumulated "speed × time"
-//                      forward distance into an equivalent reverse
-//                      time at the (faster) reverse PWM speed,
-//                      then applies a 0.95 safety factor so the
-//                      robot never over-shoots its start position.
-//
-//  RPi → Arduino serial protocol (115200 baud):
+//  RPi -> Arduino serial protocol (115200 baud):
 //    3 bytes per detected ball frame:
 //      [0] 0xFF   : header / sync byte
 //      [1] x_byte : 0-255 mapped from pixel x (clamped to 0-254)
 //      [2] y_byte : 0-255 mapped from pixel y (clamped to 0-254)
-//    Silence for > BALL_TIMEOUT_MS → ball lost.
+//    Silence for > BALL_TIMEOUT_MS -> ball lost.
 //    Arduino re-syncs by scanning for 0xFF, so stale debug bytes
 //    cannot cause misalignment. x/y bytes are clamped to 0-254
 //    so they never accidentally look like the header.
@@ -150,7 +139,7 @@ const unsigned long IR_SAMPLE_TIME = 10000;  // microseconds
 
 // ================= BALL-TRACK SPEEDS =================
 #define TRACK_SPEED          7    // RPM forward during tracking
-#define CREEP_SPEED_BALL     3    // RPM forward during collection creep
+#define CREEP_SPEED_BALL     3    // RPM forward during collection
 #define MAX_CORRECTION       3    // RPM differential cap
 
 // ================= BALL HEADING CORRECTION =================
@@ -165,19 +154,40 @@ uint8_t pkt[2] = {0, 0};
 
 bool ballVisible() { return (millis() - lastPacketMs < BALL_TIMEOUT_MS); }
 
-// ================= ARC BALL-INTERCEPT THRESHOLDS =================
-// The robot only interrupts the arc when the ball is close enough to
-// be worth chasing.  Both pixel coordinates must exceed their threshold.
-// X >= 190 keeps the ball roughly centred or to the right of frame.
-// Y >= 240 means the ball is very close (near bottom of frame).
-// Adjust these to taste based on camera field of view and robot geometry.
-#define BALL_ARC_X_THRESHOLD  190
-#define BALL_ARC_Y_THRESHOLD  240
+// ================= FRONT IR PROXIMITY DETECTION =================
+//
+// The Sharp IR sensors curl back at very close range: the output
+// voltage (and therefore the computed distance) starts rising again
+// once the wall is closer than ~10-15 cm.  This means a reading of,
+// say, 21 cm could mean "wall is 21 cm away" (reliable) OR "wall is
+// ~5 cm away and the sensor has wrapped" (unreliable).
+//
+// Strategy: during ball collection we watch for the sensor reading
+// rising above FRONT_IR_AMBIGUOUS_CM.  That rising trend is only
+// possible if the robot has driven close enough to enter the wrap
+// zone — a genuine 21 cm wall would have triggered the normal pivot
+// before ball collection even started.  So any value above this
+// threshold during collection means "we are very close to the wall".
+//
+// On reverse, we wait for the reading to fall back BELOW
+// FRONT_STOP_DIST and stay there for FRONT_CLEAR_CONFIRM_COUNT
+// consecutive IR samples (~100 ms each by default).  That confirms
+// the sensor has exited the ambiguous zone and the robot is at a
+// safe distance again.
+//
+// FRONT_IR_AMBIGUOUS_CM: readings above this during approach signal
+//   that the sensor has entered the curl-back zone.  Set just above
+//   the typical "true" FRONT_STOP_DIST reading so normal stopping
+//   distances don't accidentally arm the flag.
+#define FRONT_IR_AMBIGUOUS_CM     23.0f  // cm — arm threshold during approach
+#define FRONT_CLEAR_CONFIRM_COUNT  4     // consecutive samples needed to confirm clear
 
-// ================= REVERSE SCALING =================
-// Safety factor applied to the computed reverse duration so the robot
-// does not quite return to where it started (avoids over-shoot).
-#define REVERSE_SCALE  0.95f
+// Flag set when the front sensor entered the ambiguous zone during
+// ball approach / collection.  Cleared when the robot backs clear.
+bool  frontProximityArmed = false;
+// Counter incremented each IR cycle that frontDistanceCM < FRONT_STOP_DIST
+// while reversing; reset whenever the condition is not met.
+int   frontClearCount     = 0;
 
 // ================= IR READINGS =================
 float frontDistanceCM = 0;
@@ -185,44 +195,28 @@ float leftDistanceCM  = 0;
 
 // ================= TOP-LEVEL STATE MACHINE =================
 enum RobotState {
-  STATE_WALL_FOLLOW,   // default — IR-guided wall following
-  STATE_TURNING,       // 90° pivot right (inner corner)
-  STATE_WALL_LOST,     // outer-corner recovery sequence
-  STATE_BALL_OVERRIDE, // ball detected — suspends wall follow / arc
+  STATE_WALL_FOLLOW,
+  STATE_TURNING,
+  STATE_WALL_LOST,
+  STATE_BALL_OVERRIDE,
   STATE_EXIT,
   STATE_STOPPED
 };
 RobotState robotState = STATE_WALL_FOLLOW;
 
-// ── Pivot turn ──
+// -- Pivot turn --
 long turnStartCountL = 0, turnStartCountR = 0;
 
-// ── Wall-lost recovery ──
+// -- Wall-lost recovery --
 enum WallLostPhase { WL_REVERSE, WL_CREEP, WL_ARC, WL_REALIGN };
 WallLostPhase wallLostPhase  = WL_REVERSE;
 long          wallLostStartL = 0, wallLostStartR = 0;
 unsigned long arcStartMs     = 0;
 
-// ── Arc-pause state ──
-// When the arc is interrupted for ball collection, we freeze the
-// elapsed arc time so the timeout survives the interruption.
-bool          arcInterruptedByBall  = false;
-unsigned long arcElapsedBeforePause = 0;
-
-// ── Ball sub-state ──
-enum BallPhase { BP_TRACK, BP_COLLECT, BP_COLLECTED, BP_REVERSE };
+// -- Ball sub-state --
+enum BallPhase { BP_TRACK, BP_COLLECT, BP_COLLECTED };
 BallPhase     ballPhase   = BP_TRACK;
 unsigned long ballPhaseMs = 0;
-
-// ── Forward motion accumulators for reverse calculation ──
-// We accumulate speed*time products for each forward phase so the
-// reverse duration correctly accounts for the different speeds used
-// in tracking vs. collection creep.
-unsigned long trackPhaseStartMs   = 0;  // when BP_TRACK motion began
-unsigned long collectPhaseStartMs = 0;  // when BP_COLLECT began
-float         forwardSpeedTime    = 0;  // sum of (speed_rpm * dt_ms) across phases
-unsigned long reverseDurationMs   = 0;  // computed target reverse time
-unsigned long reverseStartMs      = 0;  // millis() when BP_REVERSE began
 
 // ================= ENCODER ISR =================
 void leftISR()  { leftMotor.count++; }
@@ -298,6 +292,16 @@ void updateIR() {
     frontDistanceCM = applyMA(frontMA, computeFront(fF));
     leftDistanceCM  = applyMA(leftMA,  computeLeft(fL));
     prevIRTime += IR_SAMPLE_TIME;
+
+    // -- Proximity arm: if we are in ball override and the front sensor
+    //    rises above the ambiguous threshold, record that the robot has
+    //    entered the curl-back zone. --
+    if (robotState == STATE_BALL_OVERRIDE &&
+        (ballPhase == BP_TRACK || ballPhase == BP_COLLECT)) {
+      if (frontDistanceCM > FRONT_IR_AMBIGUOUS_CM) {
+        frontProximityArmed = true;
+      }
+    }
   }
 }
 
@@ -347,36 +351,11 @@ void readSerial() {
 // ================= BREAK BEAM =================
 bool breakBeamTriggered() { return (digitalRead(BREAK_BEAM) == LOW); }
 
-// ================= ARC BALL TRIGGER =================
-// Returns true when the ball is close enough (per pixel thresholds)
-// to warrant interrupting the arc.
-bool ballCloseEnoughForArc() {
-  return ballVisible()
-      && pkt[0] >= BALL_ARC_X_THRESHOLD
-      && pkt[1] >= BALL_ARC_Y_THRESHOLD;
-}
-
-// ================= REVERSE DURATION HELPER =================
-// Computes how long to reverse (ms) given accumulated forward
-// speed*time and the open-loop reverse speed, scaled by REVERSE_SCALE.
-//
-//   distance_proxy = sum of (speed_rpm * duration_ms) for each fwd phase
-//   t_reverse_ms   = distance_proxy / WALL_LOST_OL_SPEED * REVERSE_SCALE
-//
-// Using RPM as a speed proxy is valid because the wheel CPR and
-// gearing cancel out when comparing forward and reverse on the same
-// drivetrain.
-unsigned long computeReverseDuration(float speedTimeProduct) {
-  if (WALL_LOST_OL_SPEED <= 0 || speedTimeProduct <= 0) return 0;
-  return (unsigned long)(speedTimeProduct / (float)WALL_LOST_OL_SPEED
-                         * REVERSE_SCALE);
-}
-
 // ====================================================================
 //  STATE HANDLERS
 // ====================================================================
 
-// ── Wall Follow ─────────────────────────────────────────────────────
+// -- Wall Follow -----------------------------------------------------
 void doWallFollow() {
   if (millis() - stateEntryMs < STATE_ENTRY_DELAY_MS) return;
 
@@ -408,7 +387,7 @@ void doWallFollow() {
   rightMotor.targetRPM = constrain(baseRPM + correction, 0, 20);
 }
 
-// ── Pivot Turn ──────────────────────────────────────────────────────
+// -- Pivot Turn ------------------------------------------------------
 void doTurning() {
   if (millis() - stateEntryMs < STATE_ENTRY_DELAY_MS) return;
 
@@ -427,7 +406,7 @@ void doTurning() {
   setMotorPWM(rightMotor, (travelR < TURN_COUNTS_R) ? -pwmVal : 0);
 }
 
-// ── Wall Lost Recovery ──────────────────────────────────────────────
+// -- Wall Lost Recovery ----------------------------------------------
 void doWallLost() {
   if (millis() - stateEntryMs < STATE_ENTRY_DELAY_MS) return;
 
@@ -456,11 +435,9 @@ void doWallLost() {
       long creepR = abs(rightMotor.count - wallLostStartR);
       if (creepL >= CREEP_COUNTS_L_WF && creepR >= CREEP_COUNTS_R_WF) {
         hardStop();
-        arcStartMs              = millis();
-        arcElapsedBeforePause   = 0;
-        arcInterruptedByBall    = false;
-        wallLostPhase           = WL_ARC;
-        stateEntryMs            = millis();
+        arcStartMs    = millis();
+        wallLostPhase = WL_ARC;
+        stateEntryMs  = millis();
         return;
       }
       int pwmVal = map(WALL_LOST_OL_SPEED, 0, 20, 0, 255);
@@ -470,40 +447,17 @@ void doWallLost() {
     }
 
     case WL_ARC: {
-      // Wall re-acquired: arc complete
       if (leftDistanceCM <= WALL_RECOVERY_DIST) {
         hardStop();
-        arcInterruptedByBall = false;
         stateEntryMs = millis();
         robotState   = STATE_WALL_FOLLOW;
         return;
       }
-
-      // Arc timeout — uses accumulated elapsed time so pauses don't
-      // eat into the budget
-      unsigned long arcElapsedNow = arcElapsedBeforePause
-                                  + (millis() - arcStartMs);
-      if (arcElapsedNow > ARC_TIMEOUT_MS) {
+      if (millis() - arcStartMs > ARC_TIMEOUT_MS) {
         hardStop();
-        arcInterruptedByBall = false;
         robotState = STATE_STOPPED;
         return;
       }
-
-      // Ball close enough to collect — interrupt arc
-      if (ballCloseEnoughForArc()) {
-        hardStop();
-        arcElapsedBeforePause += (millis() - arcStartMs);
-        arcInterruptedByBall   = true;
-        // Reset forward accumulators for a fresh collection cycle
-        forwardSpeedTime    = 0;
-        trackPhaseStartMs   = millis();
-        ballPhase           = BP_TRACK;
-        ballPhaseMs         = millis();
-        robotState          = STATE_BALL_OVERRIDE;
-        return;
-      }
-
       setMotorPWM(rightMotor, map(ARC_OUTER_SPEED, 0, 20, 0, 255));
       setMotorPWM(leftMotor,  map(ARC_INNER_SPEED, 0, 20, 0, 255));
       break;
@@ -526,25 +480,20 @@ void doWallLost() {
   }
 }
 
-// ── Ball Override (TRACK → COLLECT → COLLECTED → [REVERSE]) ─────────
+// -- Ball Override (TRACK -> COLLECT -> COLLECTED) -------------------
 void doBallOverride() {
 
   switch (ballPhase) {
 
-    // ── Track: steer toward ball, accumulate speed*time ─────────────
+    // Track: differential steer toward ball
     case BP_TRACK: {
       if (millis() - ballPhaseMs < BALL_ENTRY_DELAY_MS) return;
 
-      // Ball left frame — it is at the intake; begin collection creep
       if (!ballVisible()) {
-        // Accumulate track phase contribution: TRACK_SPEED * duration_ms
-        forwardSpeedTime += (float)TRACK_SPEED
-                          * (float)(millis() - trackPhaseStartMs);
         rollersOn();
         hardStop();
-        collectPhaseStartMs = millis();
-        ballPhase           = BP_COLLECT;
-        ballPhaseMs         = millis();
+        ballPhase   = BP_COLLECT;
+        ballPhaseMs = millis();
         return;
       }
 
@@ -562,17 +511,19 @@ void doBallOverride() {
       break;
     }
 
-    // ── Collect: creep forward, accumulate speed*time ────────────────
+    // Collect: rollers on, creep until break beam or timeout
     case BP_COLLECT: {
       rollersOn();
 
-      bool beamFired = breakBeamTriggered();
-      bool timedOut  = (millis() - ballPhaseMs > 3000);
+      if (breakBeamTriggered()) {
+        hardStop();
+        rollersOff();
+        ballPhase   = BP_COLLECTED;
+        ballPhaseMs = millis();
+        return;
+      }
 
-      if (beamFired || timedOut) {
-        // Accumulate collect phase contribution: CREEP_SPEED_BALL * duration_ms
-        forwardSpeedTime += (float)CREEP_SPEED_BALL
-                          * (float)(millis() - collectPhaseStartMs);
+      if (millis() - ballPhaseMs > 3000) {
         hardStop();
         rollersOff();
         ballPhase   = BP_COLLECTED;
@@ -585,53 +536,66 @@ void doBallOverride() {
       break;
     }
 
-    // ── Collected: brief pause, then decide next action ──────────────
+    // Collected: 2 s pause, then either reverse-to-clear or return to wall-follow.
+    //
+    // Reverse logic runs every loop tick (not gated on the pause timer) so
+    // the IR check and motor commands execute at the full loop rate.
+    // A one-shot flag (reversing) activates after the pause expires and stays
+    // set until the front sensor is confirmed clear.
     case BP_COLLECTED: {
-      hardStop();
       rollersOff();
-      if (millis() - ballPhaseMs > 2000) {
-        while (Serial.available()) Serial.read();
-        lastPacketMs = 0;
 
-        if (arcInterruptedByBall) {
-          // Compute reverse duration from accumulated forward speed*time
-          reverseDurationMs = computeReverseDuration(forwardSpeedTime);
-          if (reverseDurationMs > 0) {
-            reverseStartMs = millis();
-            ballPhase      = BP_REVERSE;
-            ballPhaseMs    = millis();
-          } else {
-            // Nothing meaningful to reverse — go straight back to arc
-            arcStartMs    = millis();
-            wallLostPhase = WL_ARC;
-            stateEntryMs  = millis();
-            robotState    = STATE_WALL_LOST;
-          }
-        } else {
-          stateEntryMs = millis();
-          robotState   = STATE_WALL_FOLLOW;
-        }
-      }
-      break;
-    }
-
-    // ── Reverse: drive straight back, then resume arc ────────────────
-    // Both motors run at the same open-loop reverse PWM (WALL_LOST_OL_SPEED)
-    // for the pre-computed duration.  Using a shared time target instead of
-    // per-wheel encoder counts guarantees straight-line motion regardless of
-    // any encoder asymmetry.
-    case BP_REVERSE: {
-      if (millis() - reverseStartMs >= reverseDurationMs) {
+      // ---- Pause phase: hold still for 2 s ----
+      if (millis() - ballPhaseMs <= 2000) {
         hardStop();
-        arcStartMs    = millis();   // restart arc segment timer
-        wallLostPhase = WL_ARC;
-        stateEntryMs  = millis();
-        robotState    = STATE_WALL_LOST;
-        return;
+        break;
       }
+
+      // ---- One-time setup on first tick after pause ----
+      // Flush stale serial packets so we don't immediately re-trigger ball
+      // detection once we return to wall-follow.
+      static bool postPauseInit = false;
+      if (!postPauseInit) {
+        while (Serial.available()) Serial.read();
+        lastPacketMs    = 0;
+        frontClearCount = 0;
+        postPauseInit   = true;
+      }
+
+      // ---- No proximity issue: return to wall-follow immediately ----
+      if (!frontProximityArmed) {
+        hardStop();
+        postPauseInit       = false;
+        frontProximityArmed = false;
+        stateEntryMs        = millis();
+        robotState          = STATE_WALL_FOLLOW;
+        break;
+      }
+
+      // ---- Proximity armed: reverse until front IR is reliably clear ----
+      // Drive both motors backward at the same open-loop PWM used elsewhere.
       int pwmVal = map(WALL_LOST_OL_SPEED, 0, 20, 0, 255);
       setMotorPWM(leftMotor,  -pwmVal);
       setMotorPWM(rightMotor, -pwmVal);
+
+      // Increment confirmation counter only while the reading is below
+      // FRONT_STOP_DIST (sensor has exited the curl-back zone).
+      // Reset it any time the reading is ambiguous (high or zero) so we
+      // require a clean consecutive run.
+      if (frontDistanceCM > 0.0f && frontDistanceCM < FRONT_STOP_DIST) {
+        frontClearCount++;
+      } else {
+        frontClearCount = 0;
+      }
+
+      if (frontClearCount >= FRONT_CLEAR_CONFIRM_COUNT) {
+        hardStop();
+        postPauseInit       = false;
+        frontProximityArmed = false;
+        frontClearCount     = 0;
+        stateEntryMs        = millis();
+        robotState          = STATE_WALL_FOLLOW;
+      }
       break;
     }
   }
@@ -666,16 +630,15 @@ void setup() {
   stateEntryMs    = millis();
 
   Serial.println("=== Wall-Follow + Ball Collector Started ===");
-  Serial.print("Target left dist : "); Serial.print(TARGET_LEFT_DIST);           Serial.println(" cm");
-  Serial.print("Wall lost dist   : "); Serial.print(WALL_LOST_DIST);             Serial.println(" cm");
-  Serial.print("Base speed       : "); Serial.print(BASE_SPEED);                 Serial.println(" RPM");
-  Serial.print("Track speed      : "); Serial.print(TRACK_SPEED);                Serial.println(" RPM");
-  Serial.print("Creep speed      : "); Serial.print(CREEP_SPEED_BALL);           Serial.println(" RPM");
-  Serial.print("Ball timeout     : "); Serial.print(BALL_TIMEOUT_MS);            Serial.println(" ms");
-  Serial.print("Entry delay (WF) : "); Serial.print(STATE_ENTRY_DELAY_MS);       Serial.println(" ms");
-  Serial.print("Arc ball X thr   : "); Serial.print(BALL_ARC_X_THRESHOLD);       Serial.println(" px");
-  Serial.print("Arc ball Y thr   : "); Serial.print(BALL_ARC_Y_THRESHOLD);       Serial.println(" px");
-  Serial.print("Reverse scale    : "); Serial.print(REVERSE_SCALE);              Serial.println("");
+  Serial.print("Target left dist    : "); Serial.print(TARGET_LEFT_DIST);              Serial.println(" cm");
+  Serial.print("Wall lost dist      : "); Serial.print(WALL_LOST_DIST);                Serial.println(" cm");
+  Serial.print("Base speed          : "); Serial.print(BASE_SPEED);                    Serial.println(" RPM");
+  Serial.print("Track speed         : "); Serial.print(TRACK_SPEED);                   Serial.println(" RPM");
+  Serial.print("Creep speed         : "); Serial.print(CREEP_SPEED_BALL);              Serial.println(" RPM");
+  Serial.print("Ball timeout        : "); Serial.print(BALL_TIMEOUT_MS);               Serial.println(" ms");
+  Serial.print("Entry delay (WF)    : "); Serial.print(STATE_ENTRY_DELAY_MS);          Serial.println(" ms");
+  Serial.print("Front ambiguous thr : "); Serial.print(FRONT_IR_AMBIGUOUS_CM);         Serial.println(" cm");
+  Serial.print("Front clear confirm : "); Serial.print(FRONT_CLEAR_CONFIRM_COUNT);     Serial.println(" samples");
   Serial.println("============================================");
 }
 
@@ -687,12 +650,11 @@ void loop() {
   updateIR();
   updateControl();
 
-  // Global override: ball detected while wall-following (unchanged behaviour)
+  // Global override: ball detected while wall-following
   if (robotState == STATE_WALL_FOLLOW && ballVisible()) {
     hardStop();
-    forwardSpeedTime  = 0;
-    trackPhaseStartMs = millis();
-    arcInterruptedByBall = false;
+    frontProximityArmed = false;   // fresh collection cycle
+    frontClearCount     = 0;
     ballPhase   = BP_TRACK;
     ballPhaseMs = millis();
     robotState  = STATE_BALL_OVERRIDE;

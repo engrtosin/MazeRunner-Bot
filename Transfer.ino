@@ -124,6 +124,8 @@ const unsigned long IR_SAMPLE_TIME = 10000;
 #define FRONT_SLOW_DIST     30.0f
 #define WALL_LOST_DIST      50.0f
 #define WALL_RECOVERY_DIST  30.0f
+#define EXIT_FRONT_DIST  400.0f   // cm -- open space ahead signals exit
+#define EXIT_LEFT_DIST   100.0f   // cm -- open space to the left signals exit
 
 // ================= WALL-FOLLOW SPEEDS =================
 #define BASE_SPEED          20
@@ -138,8 +140,8 @@ const unsigned long IR_SAMPLE_TIME = 10000;
 #define TURN_COUNTS_R        173
 #define REVERSE_MAX_COUNTS_L 262
 #define REVERSE_MAX_COUNTS_R 265
-#define CREEP_COUNTS_L_WF    279
-#define CREEP_COUNTS_R_WF    283
+#define CREEP_COUNTS_L_WF    223 //279
+#define CREEP_COUNTS_R_WF    226 //283
 #define REALIGN_COUNTS        82
 #define ARC_TIMEOUT_MS       10000
 #define ARC_MAX_COUNTS       327
@@ -673,6 +675,15 @@ void loop() {
   readSerial();
   updateIR();
   updateControl();
+
+  // --- Exit detection (highest priority) ---
+  if (millis() > 5000 && robotState != STATE_EXIT && robotState != STATE_STOPPED) {
+    if (frontDistanceCM > EXIT_FRONT_DIST && leftDistanceCM > EXIT_LEFT_DIST) {
+      hardStop();
+      rollersOff();
+      robotState = STATE_EXIT;
+    }
+  }
 
   if (robotState == STATE_WALL_FOLLOW && ballVisible()) {
     hardStop();

@@ -124,7 +124,7 @@ const unsigned long IR_SAMPLE_TIME = 10000;
 #define FRONT_SLOW_DIST     30.0f
 #define WALL_LOST_DIST      50.0f
 #define WALL_RECOVERY_DIST  30.0f
-#define EXIT_FRONT_DIST  400.0f   // cm -- open space ahead signals exit
+#define EXIT_FRONT_DIST  200.0f   // cm -- open space ahead signals exit
 #define EXIT_LEFT_DIST   100.0f   // cm -- open space to the left signals exit
 
 // ================= WALL-FOLLOW SPEEDS =================
@@ -132,7 +132,7 @@ const unsigned long IR_SAMPLE_TIME = 10000;
 #define SLOW_SPEED_WF        7
 #define WALL_LOST_OL_SPEED   3
 #define TURN_SPEED           7
-#define ARC_OUTER_SPEED      5
+#define ARC_OUTER_SPEED      6
 #define ARC_INNER_SPEED      2
 
 // ================= PIVOT / RECOVERY GEOMETRY =================
@@ -140,8 +140,8 @@ const unsigned long IR_SAMPLE_TIME = 10000;
 #define TURN_COUNTS_R        173
 #define REVERSE_MAX_COUNTS_L 262
 #define REVERSE_MAX_COUNTS_R 265
-#define CREEP_COUNTS_L_WF    223 //279
-#define CREEP_COUNTS_R_WF    226 //283
+#define CREEP_COUNTS_L_WF    203 //279
+#define CREEP_COUNTS_R_WF    206 //283
 #define REALIGN_COUNTS        82
 #define ARC_TIMEOUT_MS       10000
 #define ARC_MAX_COUNTS       327
@@ -161,6 +161,17 @@ float Kp_heading = 0.030f;
 unsigned long lastPacketMs = 0;
 uint8_t pkt[2] = {0, 0};
 bool ballVisible() { return (millis() - lastPacketMs < BALL_TIMEOUT_MS); }
+
+// ================= BALL GIVE UP - close to wall =================
+#define BALL_TOO_CLOSE_TO_WALL  15.0f   // cm -- give up if left dist is under this during tracking
+#define BALL_GIVUP_COOLDOWN_MS  2000
+unsigned long ballGiveUpMs = 0;
+bool ballCooldown = false;
+
+// ================= EXIT LOGIC =================
+#define EXIT_CONFIRM_MS  500   // how long the condition must hold
+unsigned long exitDetectedMs = 0;
+bool exitCandidate = false;
 
 // ================= ARC ROLLER ASSIST THRESHOLD =================
 // Rollers activate during WL_ARC only when the ball Y pixel is at or
@@ -214,6 +225,10 @@ unsigned long arcStartMs     = 0;
 enum BallPhase { BP_TRACK, BP_COLLECT, BP_COLLECTED };
 BallPhase     ballPhase   = BP_TRACK;
 unsigned long ballPhaseMs = 0;
+
+enum ExitPhase { EX_CREEP, EX_STOP };
+ExitPhase exitPhase = EX_CREEP;
+long exitStartL = 0, exitStartR = 0;
 
 // ================= ENCODER ISR =================
 void leftISR()  { leftMotor.count++; }
@@ -486,13 +501,23 @@ void doWallLost() {
   }
 }
 
-// ── Ball Override ───────────────────────────────────────────────────
+// â€â€ Ball Override â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€
 void doBallOverride() {
 
   switch (ballPhase) {
 
     case BP_TRACK: {
       if (millis() - ballPhaseMs < BALL_ENTRY_DELAY_MS) return;
+
+      // Give up if ball is too close to left wall
+      if (leftDistanceCM < BALL_TOO_CLOSE_TO_WALL) {
+        hardStop();
+        ballCooldown  = true;
+        ballGiveUpMs  = millis();
+        stateEntryMs  = millis();
+        robotState    = STATE_WALL_FOLLOW;
+        return;
+      }
 
       if (!ballVisible()) {
         rollersOn();
@@ -531,7 +556,7 @@ void doBallOverride() {
       break;
     }
 
-    // ── Collected ───────────────────────────────────────────────────
+    // â€â€ Collected â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€
     //
     // After the 2 s pause, check whether the front IR is in the
     // danger band.  If it is, reverse.  While reversing:
@@ -625,6 +650,21 @@ void doBallOverride() {
   }
 }
 
+void doExit() {
+  if (exitPhase == EX_CREEP) {
+    long tL = abs(leftMotor.count - exitStartL);
+    long tR = abs(rightMotor.count - exitStartR);
+    if (tL >= CREEP_COUNTS_L_WF && tR >= CREEP_COUNTS_R_WF) {
+      hardStop();
+      exitPhase = EX_STOP;
+    } else {
+      int pwmVal = map(WALL_LOST_OL_SPEED, 0, 20, 0, 255);
+      setMotorPWM(leftMotor,  pwmVal);
+      setMotorPWM(rightMotor, pwmVal);
+    }
+  }
+}
+
 // ====================================================================
 //  SETUP
 // ====================================================================
@@ -677,19 +717,34 @@ void loop() {
   updateControl();
 
   // --- Exit detection (highest priority) ---
-  if (millis() > 5000 && robotState != STATE_EXIT && robotState != STATE_STOPPED) {
-    if (frontDistanceCM > EXIT_FRONT_DIST && leftDistanceCM > EXIT_LEFT_DIST) {
-      hardStop();
-      rollersOff();
-      robotState = STATE_EXIT;
+  if (robotState != STATE_EXIT && robotState != STATE_STOPPED) {
+    if (millis() > 3000 && frontDistanceCM > EXIT_FRONT_DIST && leftDistanceCM > EXIT_LEFT_DIST) {
+      if (!exitCandidate) {
+        exitCandidate   = true;
+        exitDetectedMs  = millis();
+      } else if (millis() - exitDetectedMs >= EXIT_CONFIRM_MS) {
+        hardStop();
+        rollersOff();
+        exitPhase  = EX_CREEP;
+        exitStartL = leftMotor.count;
+        exitStartR = rightMotor.count;
+        robotState = STATE_EXIT;
+        exitCandidate = false;
+      }
+    } else {
+      exitCandidate = false;  // condition broke, reset
     }
   }
 
-  if (robotState == STATE_WALL_FOLLOW && ballVisible()) {
+  if (robotState == STATE_WALL_FOLLOW && ballVisible() && !ballCooldown) {
     hardStop();
     ballPhase   = BP_TRACK;
     ballPhaseMs = millis();
     robotState  = STATE_BALL_OVERRIDE;
+  }
+
+  if (ballCooldown && millis() - ballGiveUpMs >= BALL_GIVUP_COOLDOWN_MS) {
+    ballCooldown = false;
   }
 
   switch (robotState) {
@@ -697,7 +752,7 @@ void loop() {
     case STATE_TURNING:       doTurning();      break;
     case STATE_WALL_LOST:     doWallLost();     break;
     case STATE_BALL_OVERRIDE: doBallOverride(); break;
-    case STATE_EXIT:                            break;
+    case STATE_EXIT:          doExit();         break;
     case STATE_STOPPED:       hardStop();       break;
   }
 }

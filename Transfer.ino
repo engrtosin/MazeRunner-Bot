@@ -36,6 +36,21 @@
 //  directional movement of the reading (after a small settling
 //  window) is upward it is Case A; if it is downward it is Case B.
 //
+//  Forward stall recovery:
+//    During PID-driven forward motion (STATE_WALL_FOLLOW,
+//    STATE_BALL_OVERRIDE), each wheel encoder is watched
+//    independently.  If a wheel has not advanced in
+//    STALL_DETECT_MS while its targetRPM > 0, a stall is declared.
+//    The robot enters STATE_STALL_RECOVERY, reverses with a bias
+//    away from the stuck wheel for STALL_REVERSE_MS, then returns
+//    to the state that was interrupted.
+//
+//  Reverse timeouts:
+//    All open-loop reverse motions (WL_REVERSE, BP_COLLECTED
+//    reverse) are bounded by REVERSE_TIMEOUT_MS.  If the sensor-
+//    based exit condition is not met in time the reverse is treated
+//    as complete and the normal next step is taken.
+//
 //  RPi -> Arduino serial protocol (115200 baud):
 //    3 bytes per detected ball frame:
 //      [0] 0xFF   : header / sync byte
@@ -124,8 +139,8 @@ const unsigned long IR_SAMPLE_TIME = 10000;
 #define FRONT_SLOW_DIST     30.0f
 #define WALL_LOST_DIST      50.0f
 #define WALL_RECOVERY_DIST  30.0f
-#define EXIT_FRONT_DIST  200.0f   // cm -- open space ahead signals exit
-#define EXIT_LEFT_DIST   100.0f   // cm -- open space to the left signals exit
+#define EXIT_FRONT_DIST    200.0f
+#define EXIT_LEFT_DIST     100.0f
 
 // ================= WALL-FOLLOW SPEEDS =================
 #define BASE_SPEED          20
@@ -140,8 +155,8 @@ const unsigned long IR_SAMPLE_TIME = 10000;
 #define TURN_COUNTS_R        173
 #define REVERSE_MAX_COUNTS_L 262
 #define REVERSE_MAX_COUNTS_R 265
-#define CREEP_COUNTS_L_WF    203 //279
-#define CREEP_COUNTS_R_WF    206 //283
+#define CREEP_COUNTS_L_WF    203
+#define CREEP_COUNTS_R_WF    206
 #define REALIGN_COUNTS        82
 #define ARC_TIMEOUT_MS       10000
 #define ARC_MAX_COUNTS       327
@@ -163,42 +178,39 @@ uint8_t pkt[2] = {0, 0};
 bool ballVisible() { return (millis() - lastPacketMs < BALL_TIMEOUT_MS); }
 
 // ================= BALL GIVE UP - close to wall =================
-#define BALL_TOO_CLOSE_TO_WALL  15.0f   // cm -- give up if left dist is under this during tracking
-#define BALL_GIVUP_COOLDOWN_MS  2000
+#define BALL_TOO_CLOSE_TO_WALL  11.0f
+#define BALL_GIVUP_COOLDOWN_MS  500
 unsigned long ballGiveUpMs = 0;
 bool ballCooldown = false;
 
 // ================= EXIT LOGIC =================
-#define EXIT_CONFIRM_MS  500   // how long the condition must hold
+#define EXIT_CONFIRM_MS  500
 unsigned long exitDetectedMs = 0;
 bool exitCandidate = false;
 
 // ================= ARC ROLLER ASSIST THRESHOLD =================
-// Rollers activate during WL_ARC only when the ball Y pixel is at or
-// above this value (0 = top of frame / far, 254 = bottom / close).
-// Keeps rollers off for distant balls that are unlikely to reach the
-// intake during the arc sweep.
 #define BALL_ARC_Y_THRESHOLD  127
 
 // ================= POST-COLLECTION REVERSE THRESHOLDS =================
-//
-// After collecting, if frontDistanceCM is inside [FRONT_REV_BAND_LO,
-// FRONT_REV_BAND_HI] the robot needs to reverse before wall-following.
-//
-// FRONT_REV_BAND_LO : lower bound of the danger band.  Below this the
-//   reading is reliable and the robot is far enough to turn normally.
-// FRONT_REV_BAND_HI : upper bound.  Above this the wall is not a concern
-//   (open space ahead).
-// FRONT_REV_RISE_CLEAR : Case A exit -- stop once the reading has risen
-//   this many cm above the value seen at the start of reverse.
-//   (robot was close but not in curl-back; a small retreat is enough)
-// FRONT_STOP_DIST is reused as the Case B exit target -- once the sensor
-//   climbs back to this value after the curl-back dip the robot is at
-//   the normal pivot distance and wall-follow can resume safely.
-//
-#define FRONT_REV_BAND_LO    20.0f   // cm -- start reversing if above this
-#define FRONT_REV_BAND_HI    33.0f   // cm -- start reversing if below this
-#define FRONT_REV_RISE_CLEAR  5.0f   // cm -- Case A: rise needed to stop
+#define FRONT_REV_BAND_LO    20.0f
+#define FRONT_REV_BAND_HI    33.0f
+#define FRONT_REV_RISE_CLEAR  5.0f
+
+// ================= REVERSE TIMEOUT =================
+// Applies to all open-loop reverse motions (WL_REVERSE and
+// BP_COLLECTED reverse).  If the sensor-based exit condition is
+// not met within this period, reverse is considered done.
+#define REVERSE_TIMEOUT_MS  5000
+
+// ================= STALL DETECTION / RECOVERY =================
+// STALL_DETECT_MS  : how long a wheel can be stationary while
+//                    targetRPM > 0 before a stall is declared.
+// STALL_REVERSE_MS : how long the biased reverse lasts.
+// STALL_REVERSE_PWM: open-loop PWM used for the recovery reverse.
+//                    Kept moderate so the bias is effective.
+#define STALL_DETECT_MS    500
+#define STALL_REVERSE_MS  1000
+#define STALL_REVERSE_PWM  60
 
 // ================= IR READINGS =================
 float frontDistanceCM = 0;
@@ -210,6 +222,7 @@ enum RobotState {
   STATE_TURNING,
   STATE_WALL_LOST,
   STATE_BALL_OVERRIDE,
+  STATE_STALL_RECOVERY,
   STATE_EXIT,
   STATE_STOPPED
 };
@@ -221,6 +234,7 @@ enum WallLostPhase { WL_REVERSE, WL_CREEP, WL_ARC, WL_REALIGN };
 WallLostPhase wallLostPhase  = WL_REVERSE;
 long          wallLostStartL = 0, wallLostStartR = 0;
 unsigned long arcStartMs     = 0;
+unsigned long wlReverseStartMs = 0;   // timeout for WL_REVERSE
 
 enum BallPhase { BP_TRACK, BP_COLLECT, BP_COLLECTED };
 BallPhase     ballPhase   = BP_TRACK;
@@ -229,6 +243,21 @@ unsigned long ballPhaseMs = 0;
 enum ExitPhase { EX_CREEP, EX_STOP };
 ExitPhase exitPhase = EX_CREEP;
 long exitStartL = 0, exitStartR = 0;
+
+// ================= STALL RECOVERY STATE =================
+// resumeState  : state to return to after recovery completes.
+// stallBiasLeft: true  -> left wheel was stuck, reverse turns right
+//                         (left motor gets less reverse than right)
+//                false -> right wheel was stuck, reverse turns left
+unsigned long stallRecoveryStartMs = 0;
+RobotState    stallResumeState     = STATE_WALL_FOLLOW;
+bool          stallBiasLeft        = false;   // which wheel stalled
+
+// Per-wheel stall tracking (updated in stall detector, not in ISR)
+unsigned long leftStallSinceMs  = 0;
+unsigned long rightStallSinceMs = 0;
+long          lastStallCheckL   = 0;
+long          lastStallCheckR   = 0;
 
 // ================= ENCODER ISR =================
 void leftISR()  { leftMotor.count++; }
@@ -360,6 +389,67 @@ void readSerial() {
 // ================= BREAK BEAM =================
 bool breakBeamTriggered() { return digitalRead(BREAK_BEAM) == LOW; }
 
+// ================= STALL DETECTOR =================
+// Called every loop iteration.  Only active during PID-driven
+// forward states.  Triggers STATE_STALL_RECOVERY when either
+// wheel has been stationary for STALL_DETECT_MS while commanded.
+void checkStall() {
+  if (robotState != STATE_WALL_FOLLOW &&
+      robotState != STATE_BALL_OVERRIDE) {
+    // Reset timers whenever we leave PID-driven states so we
+    // don't carry stale timestamps into the next forward phase.
+    leftStallSinceMs  = millis();
+    rightStallSinceMs = millis();
+    lastStallCheckL   = leftMotor.count;
+    lastStallCheckR   = rightMotor.count;
+    return;
+  }
+
+  unsigned long now = millis();
+
+  // Left wheel
+  if (leftMotor.targetRPM > 0) {
+    if (leftMotor.count != lastStallCheckL) {
+      lastStallCheckL  = leftMotor.count;
+      leftStallSinceMs = now;
+    } else if (now - leftStallSinceMs > STALL_DETECT_MS) {
+      // Left wheel stalled: bias reverse turns robot left (right
+      // wheel gets full reverse, left wheel gets reduced reverse)
+      hardStop();
+      rollersOff();
+      stallBiasLeft        = true;
+      stallResumeState     = robotState;
+      stallRecoveryStartMs = now;
+      robotState           = STATE_STALL_RECOVERY;
+      return;
+    }
+  } else {
+    leftStallSinceMs = now;
+    lastStallCheckL  = leftMotor.count;
+  }
+
+  // Right wheel
+  if (rightMotor.targetRPM > 0) {
+    if (rightMotor.count != lastStallCheckR) {
+      lastStallCheckR   = rightMotor.count;
+      rightStallSinceMs = now;
+    } else if (now - rightStallSinceMs > STALL_DETECT_MS) {
+      // Right wheel stalled: bias reverse turns robot right (left
+      // wheel gets full reverse, right wheel gets reduced reverse)
+      hardStop();
+      rollersOff();
+      stallBiasLeft        = false;
+      stallResumeState     = robotState;
+      stallRecoveryStartMs = now;
+      robotState           = STATE_STALL_RECOVERY;
+      return;
+    }
+  } else {
+    rightStallSinceMs = now;
+    lastStallCheckR   = rightMotor.count;
+  }
+}
+
 // ====================================================================
 //  STATE HANDLERS
 // ====================================================================
@@ -369,11 +459,12 @@ void doWallFollow() {
 
   if (leftDistanceCM > WALL_LOST_DIST) {
     hardStop();
-    wallLostPhase  = WL_REVERSE;
-    wallLostStartL = leftMotor.count;
-    wallLostStartR = rightMotor.count;
-    stateEntryMs   = millis();
-    robotState     = STATE_WALL_LOST;
+    wallLostPhase    = WL_REVERSE;
+    wallLostStartL   = leftMotor.count;
+    wallLostStartR   = rightMotor.count;
+    wlReverseStartMs = millis();
+    stateEntryMs     = millis();
+    robotState       = STATE_WALL_LOST;
     return;
   }
 
@@ -421,7 +512,9 @@ void doWallLost() {
       long travelL    = abs(leftMotor.count - wallLostStartL);
       bool wallBack   = (leftDistanceCM <= WALL_RECOVERY_DIST);
       bool maxReached = (travelL >= REVERSE_MAX_COUNTS_L);
-      if (wallBack || maxReached) {
+      bool timedOut   = (millis() - wlReverseStartMs >= REVERSE_TIMEOUT_MS);
+
+      if (wallBack || maxReached || timedOut) {
         hardStop();
         wallLostStartL = leftMotor.count;
         wallLostStartR = rightMotor.count;
@@ -452,17 +545,12 @@ void doWallLost() {
     }
 
     case WL_ARC: {
-      // Roller assist: spin rollers whenever a ball is visible so it
-      // can be ingested as the robot sweeps past.  Stop rollers the
-      // moment the break beam confirms the ball is secured, or when
-      // the arc ends (both exit paths call rollersOff() below).
       if (breakBeamTriggered()) {
         rollersOff();
       } else if (ballVisible() && pkt[1] >= BALL_ARC_Y_THRESHOLD) {
         rollersOn();
       }
 
-      // Arc complete: wall re-acquired
       if (leftDistanceCM <= WALL_RECOVERY_DIST) {
         hardStop();
         rollersOff();
@@ -471,7 +559,6 @@ void doWallLost() {
         return;
       }
 
-      // Arc timeout
       if (millis() - arcStartMs > ARC_TIMEOUT_MS) {
         hardStop();
         rollersOff();
@@ -501,7 +588,7 @@ void doWallLost() {
   }
 }
 
-// â€â€ Ball Override â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€
+// ── Ball Override ──────────────────────────────────────────────────
 void doBallOverride() {
 
   switch (ballPhase) {
@@ -512,10 +599,11 @@ void doBallOverride() {
       // Give up if ball is too close to left wall
       if (leftDistanceCM < BALL_TOO_CLOSE_TO_WALL) {
         hardStop();
-        ballCooldown  = true;
-        ballGiveUpMs  = millis();
-        stateEntryMs  = millis();
-        robotState    = STATE_WALL_FOLLOW;
+        ballCooldown = true;
+        rollersOn();
+        ballGiveUpMs = millis();
+        stateEntryMs = millis();
+        robotState   = STATE_WALL_FOLLOW;
         return;
       }
 
@@ -526,6 +614,9 @@ void doBallOverride() {
         ballPhaseMs = millis();
         return;
       }
+
+      // Turn rollers on when ball is close (low in frame)
+      if (pkt[1] >= BALL_ARC_Y_THRESHOLD) rollersOn();
 
       float error      = (float)pkt[0] - (float)X_CENTER;
       float correction = 0;
@@ -556,26 +647,7 @@ void doBallOverride() {
       break;
     }
 
-    // â€â€ Collected â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€
-    //
-    // After the 2 s pause, check whether the front IR is in the
-    // danger band.  If it is, reverse.  While reversing:
-    //
-    //   - Track the reading at reverse start (revStartReading) and
-    //     the running minimum seen so far (revMinReading).
-    //
-    //   - If the reading rises from the start without ever going
-    //     below revStartReading - 1 cm (no dip), it is Case A:
-    //     stop once the reading has risen FRONT_REV_RISE_CLEAR above
-    //     revStartReading.
-    //
-    //   - If the reading drops below revStartReading - 1 cm at any
-    //     point, the curl-back zone is confirmed (Case B): keep
-    //     going until the reading climbs back up to FRONT_STOP_DIST.
-    //
-    //  The 1 cm tolerance absorbs sensor noise when deciding whether
-    //  a dip has occurred.
-    //
+    // ── Collected ─────────────────────────────────────────────────
     case BP_COLLECTED: {
       rollersOff();
 
@@ -585,31 +657,29 @@ void doBallOverride() {
         break;
       }
 
-      // Persistent state for the reverse phase, initialised once per
-      // collection cycle using a static + a fresh-cycle flag.
-      static bool  revInitDone    = false;
+      static bool  revInitDone     = false;
       static float revStartReading = 0.0f;
       static float revMinReading   = 0.0f;
       static bool  revNeedReverse  = false;
-      static bool  revCurlBack     = false;   // Case B confirmed
+      static bool  revCurlBack     = false;
+      static unsigned long revStartMs = 0;
 
-      // One-time init on first tick after the pause
       if (!revInitDone) {
         while (Serial.available()) Serial.read();
         lastPacketMs = 0;
 
-        float f = frontDistanceCM;
+        float f        = frontDistanceCM;
         revNeedReverse = (f > FRONT_REV_BAND_LO && f < FRONT_REV_BAND_HI);
         revStartReading = f;
         revMinReading   = f;
         revCurlBack     = false;
+        revStartMs      = millis();
         revInitDone     = true;
       }
 
-      // No reverse needed: return to wall-follow
       if (!revNeedReverse) {
         hardStop();
-        revInitDone = false;
+        revInitDone  = false;
         stateEntryMs = millis();
         robotState   = STATE_WALL_FOLLOW;
         break;
@@ -622,31 +692,71 @@ void doBallOverride() {
 
       float f = frontDistanceCM;
 
-      // Update running minimum
-      if (f > 0.0f && f < revMinReading) revMinReading = f;
-
-      // Detect curl-back: reading dropped more than 1 cm below start
+      if (f > 0.0f && f < revMinReading)       revMinReading = f;
       if (f > 0.0f && f < revStartReading - 1.0f) revCurlBack = true;
 
       bool done = false;
       if (!revCurlBack) {
-        // Case A: reading going up from the start -- stop once it has
-        // risen FRONT_REV_RISE_CLEAR above the starting value.
         done = (f > revStartReading + FRONT_REV_RISE_CLEAR);
       } else {
-        // Case B: curl-back confirmed -- stop once the reading has
-        // climbed back up to FRONT_STOP_DIST after the dip.
         done = (f >= FRONT_STOP_DIST);
       }
 
+      // Timeout: treat reverse as complete regardless of IR reading
+      if (millis() - revStartMs >= REVERSE_TIMEOUT_MS) done = true;
+
       if (done) {
         hardStop();
-        revInitDone = false;
+        revInitDone  = false;
         stateEntryMs = millis();
         robotState   = STATE_WALL_FOLLOW;
       }
       break;
     }
+  }
+}
+
+// ── Stall Recovery ────────────────────────────────────────────────
+//
+// Reverses with a yaw bias away from the stalled wheel:
+//   stallBiasLeft == true  (left stalled) -> right gets full reverse,
+//                                            left gets half reverse
+//                                            -> robot swings left, freeing
+//                                               left wheel from obstacle
+//   stallBiasLeft == false (right stalled) -> left gets full reverse,
+//                                             right gets half reverse
+//                                             -> robot swings right
+//
+// After STALL_REVERSE_MS the robot returns to stallResumeState.
+// stateEntryMs is reset so the resumed state gets its normal entry
+// delay before acting on sensors again.
+//
+void doStallRecovery() {
+  if (millis() - stallRecoveryStartMs >= STALL_REVERSE_MS) {
+    hardStop();
+    // Reset stall timers so we don't immediately re-trigger
+    leftStallSinceMs  = millis();
+    rightStallSinceMs = millis();
+    lastStallCheckL   = leftMotor.count;
+    lastStallCheckR   = rightMotor.count;
+    stateEntryMs      = millis();
+    robotState        = stallResumeState;
+    return;
+  }
+
+  int fullPWM = STALL_REVERSE_PWM;
+  int halfPWM = STALL_REVERSE_PWM / 2;
+
+  if (stallBiasLeft) {
+    // Left wheel stalled against something on the left.
+    // Swing robot leftward: right reverses hard, left reverses gently.
+    setMotorPWM(rightMotor, -fullPWM);
+    setMotorPWM(leftMotor,  -halfPWM);
+  } else {
+    // Right wheel stalled against something on the right.
+    // Swing robot rightward: left reverses hard, right reverses gently.
+    setMotorPWM(leftMotor,  -fullPWM);
+    setMotorPWM(rightMotor, -halfPWM);
   }
 }
 
@@ -689,9 +799,13 @@ void setup() {
   enableDriver();
   delay(2000);
 
-  lastControlTime = millis();
-  prevIRTime      = micros();
-  stateEntryMs    = millis();
+  lastControlTime   = millis();
+  prevIRTime        = micros();
+  stateEntryMs      = millis();
+  leftStallSinceMs  = millis();
+  rightStallSinceMs = millis();
+  lastStallCheckL   = 0;
+  lastStallCheckR   = 0;
 
   Serial.println("=== Wall-Follow + Ball Collector Started ===");
   Serial.print("Target left dist   : "); Serial.print(TARGET_LEFT_DIST);        Serial.println(" cm");
@@ -705,6 +819,9 @@ void setup() {
   Serial.print("Rev band hi        : "); Serial.print(FRONT_REV_BAND_HI);       Serial.println(" cm");
   Serial.print("Rev rise clear     : "); Serial.print(FRONT_REV_RISE_CLEAR);    Serial.println(" cm");
   Serial.print("Arc roller Y thr   : "); Serial.print(BALL_ARC_Y_THRESHOLD);    Serial.println(" px");
+  Serial.print("Reverse timeout    : "); Serial.print(REVERSE_TIMEOUT_MS);      Serial.println(" ms");
+  Serial.print("Stall detect       : "); Serial.print(STALL_DETECT_MS);         Serial.println(" ms");
+  Serial.print("Stall reverse      : "); Serial.print(STALL_REVERSE_MS);        Serial.println(" ms");
   Serial.println("============================================");
 }
 
@@ -715,13 +832,14 @@ void loop() {
   readSerial();
   updateIR();
   updateControl();
+  checkStall();
 
   // --- Exit detection (highest priority) ---
   if (robotState != STATE_EXIT && robotState != STATE_STOPPED) {
     if (millis() > 3000 && frontDistanceCM > EXIT_FRONT_DIST && leftDistanceCM > EXIT_LEFT_DIST) {
       if (!exitCandidate) {
-        exitCandidate   = true;
-        exitDetectedMs  = millis();
+        exitCandidate  = true;
+        exitDetectedMs = millis();
       } else if (millis() - exitDetectedMs >= EXIT_CONFIRM_MS) {
         hardStop();
         rollersOff();
@@ -732,7 +850,7 @@ void loop() {
         exitCandidate = false;
       }
     } else {
-      exitCandidate = false;  // condition broke, reset
+      exitCandidate = false;
     }
   }
 
@@ -745,6 +863,7 @@ void loop() {
 
   if (ballCooldown && millis() - ballGiveUpMs >= BALL_GIVUP_COOLDOWN_MS) {
     ballCooldown = false;
+    rollersOff();
   }
 
   switch (robotState) {
@@ -752,6 +871,7 @@ void loop() {
     case STATE_TURNING:       doTurning();      break;
     case STATE_WALL_LOST:     doWallLost();     break;
     case STATE_BALL_OVERRIDE: doBallOverride(); break;
+    case STATE_STALL_RECOVERY:doStallRecovery();break;
     case STATE_EXIT:          doExit();         break;
     case STATE_STOPPED:       hardStop();       break;
   }

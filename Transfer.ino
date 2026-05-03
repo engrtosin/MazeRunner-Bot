@@ -7,6 +7,13 @@
 //                      full TRACK -> COLLECT -> COLLECTED cycle,
 //                      then resumes wall-following automatically.
 //
+//  Arc roller assist:
+//    While executing WL_ARC, if a ball is visible the rollers are
+//    switched on so the ball can be ingested passively as the robot
+//    sweeps past.  The rollers turn off as soon as the break beam
+//    fires (ball secured) or the arc ends.  The arc motion itself
+//    is never interrupted.
+//
 //  Post-collection reverse:
 //    After collecting a ball, if the front IR reads within the
 //    danger band [FRONT_REV_BAND_LO, FRONT_REV_BAND_HI] the robot
@@ -152,6 +159,13 @@ float Kp_heading = 0.030f;
 unsigned long lastPacketMs = 0;
 uint8_t pkt[2] = {0, 0};
 bool ballVisible() { return (millis() - lastPacketMs < BALL_TIMEOUT_MS); }
+
+// ================= ARC ROLLER ASSIST THRESHOLD =================
+// Rollers activate during WL_ARC only when the ball Y pixel is at or
+// above this value (0 = top of frame / far, 254 = bottom / close).
+// Keeps rollers off for distant balls that are unlikely to reach the
+// intake during the arc sweep.
+#define BALL_ARC_Y_THRESHOLD  127
 
 // ================= POST-COLLECTION REVERSE THRESHOLDS =================
 //
@@ -421,17 +435,33 @@ void doWallLost() {
     }
 
     case WL_ARC: {
+      // Roller assist: spin rollers whenever a ball is visible so it
+      // can be ingested as the robot sweeps past.  Stop rollers the
+      // moment the break beam confirms the ball is secured, or when
+      // the arc ends (both exit paths call rollersOff() below).
+      if (breakBeamTriggered()) {
+        rollersOff();
+      } else if (ballVisible() && pkt[1] >= BALL_ARC_Y_THRESHOLD) {
+        rollersOn();
+      }
+
+      // Arc complete: wall re-acquired
       if (leftDistanceCM <= WALL_RECOVERY_DIST) {
         hardStop();
+        rollersOff();
         stateEntryMs = millis();
         robotState   = STATE_WALL_FOLLOW;
         return;
       }
+
+      // Arc timeout
       if (millis() - arcStartMs > ARC_TIMEOUT_MS) {
         hardStop();
+        rollersOff();
         robotState = STATE_STOPPED;
         return;
       }
+
       setMotorPWM(rightMotor, map(ARC_OUTER_SPEED, 0, 20, 0, 255));
       setMotorPWM(leftMotor,  map(ARC_INNER_SPEED, 0, 20, 0, 255));
       break;
@@ -632,6 +662,7 @@ void setup() {
   Serial.print("Rev band lo        : "); Serial.print(FRONT_REV_BAND_LO);       Serial.println(" cm");
   Serial.print("Rev band hi        : "); Serial.print(FRONT_REV_BAND_HI);       Serial.println(" cm");
   Serial.print("Rev rise clear     : "); Serial.print(FRONT_REV_RISE_CLEAR);    Serial.println(" cm");
+  Serial.print("Arc roller Y thr   : "); Serial.print(BALL_ARC_Y_THRESHOLD);    Serial.println(" px");
   Serial.println("============================================");
 }
 

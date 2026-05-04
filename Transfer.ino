@@ -147,8 +147,8 @@ const unsigned long IR_SAMPLE_TIME = 10000;
 #define SLOW_SPEED_WF        7
 #define WALL_LOST_OL_SPEED   3
 #define TURN_SPEED           7
-#define ARC_OUTER_SPEED      5.40f
-#define ARC_INNER_SPEED      1.80f
+#define ARC_OUTER_SPEED      6
+#define ARC_INNER_SPEED      2
 
 // ================= PIVOT / RECOVERY GEOMETRY =================
 #define TURN_COUNTS_L        171
@@ -162,8 +162,8 @@ const unsigned long IR_SAMPLE_TIME = 10000;
 #define ARC_MAX_COUNTS       327
 
 // ================= BALL-TRACK SPEEDS =================
-#define TRACK_SPEED       10
-#define CREEP_SPEED_BALL  4
+#define TRACK_SPEED       7
+#define CREEP_SPEED_BALL  3
 #define MAX_CORRECTION    3
 
 // ================= BALL HEADING CORRECTION =================
@@ -178,6 +178,7 @@ uint8_t pkt[2] = {0, 0};
 bool ballVisible() { return (millis() - lastPacketMs < BALL_TIMEOUT_MS); }
 
 // ================= BALL GIVE UP - close to wall =================
+#define ROLLERS_TIMEOUT_MS      5000
 #define BALL_TOO_CLOSE_TO_WALL  14.0f
 #define BALL_GIVUP_COOLDOWN_MS  3000
 unsigned long ballGiveUpMs = 0;
@@ -597,17 +598,17 @@ void doBallOverride() {
       if (millis() - ballPhaseMs < BALL_ENTRY_DELAY_MS) return;
 
       // Give up if ball is too close to left wall
-      if (leftDistanceCM < BALL_TOO_CLOSE_TO_WALL) {
-        hardStop();
-        ballCooldown = true;
-        rollersOn();
-        ballGiveUpMs = millis();
-        stateEntryMs = millis();
-        robotState   = STATE_WALL_FOLLOW;
-        return;
-      }
+//      if (leftDistanceCM < BALL_TOO_CLOSE_TO_WALL) {
+//        hardStop();
+//        ballCooldown = true;
+//        rollersOn();
+//        ballGiveUpMs = millis();
+//        stateEntryMs = millis();
+//        robotState   = STATE_WALL_FOLLOW;
+//        return;
+//      }
 
-      if (!ballVisible()) {
+      if (!ballVisible() || leftDistanceCM < BALL_TOO_CLOSE_TO_WALL) {
         rollersOn();
         hardStop();
         ballPhase   = BP_COLLECT;
@@ -634,7 +635,7 @@ void doBallOverride() {
     case BP_COLLECT: {
       rollersOn();
 
-      if (breakBeamTriggered() || millis() - ballPhaseMs > 3000) {
+      if (breakBeamTriggered() || millis() - ballPhaseMs > ROLLERS_TIMEOUT_MS) {
         hardStop();
         rollersOff();
         ballPhase   = BP_COLLECTED;
